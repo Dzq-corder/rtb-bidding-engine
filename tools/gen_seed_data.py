@@ -234,14 +234,14 @@ def gen_ads(count, out_dir):
     target_path = os.path.join(out_dir, "ad_target.csv")
 
     with open(ad_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
+        w = csv.writer(f, lineterminator="\n")
         w.writerow(["id", "advertiser_id", "title", "creative_url",
                     "category_code", "bid", "daily_budget", "status",
                     "created_at", "updated_at"])
         w.writerows(ad_rows)
 
     with open(target_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
+        w = csv.writer(f, lineterminator="\n")
         w.writerow(["id", "ad_id", "dim_type", "dim_value"])
         # id 需要全局唯一，这里用 offset 保证
         w.writerows([[i + 1, r[0], r[1], r[2]] for i, r in enumerate(target_rows)])
@@ -251,6 +251,20 @@ def gen_ads(count, out_dir):
     print(f"  定向倒排 {len(target_rows):>10,} 行 -> {target_path}")
     print(f"  平均定向项/广告 = {len(target_rows) / len(ad_rows):.2f}")
     print(f"  耗时 {time.time() - t0:.0f}s")
+
+    # ---- 自检：行尾必须是纯 \n，不能带 \r ----
+    # 踩过的坑：csv.writer 默认写 \r\n，而导入端 LINES TERMINATED BY '\n'
+    # 会把 \r 留在最后一个字段里，于是查 'male' 查不到、实际值是 'male\r'。
+    # 表现为 GROUP BY 能看到该值、等值匹配却恒为 0，极难定位。
+    for path, last_col in ((ad_path, "updated_at"), (target_path, "dim_value")):
+        with open(path, "rb") as f:
+            head = f.read(4096)
+        if b"\r" in head:
+            raise SystemExit(
+                f"自检失败：{os.path.basename(path)} 含 CR 字符。"
+                f"检查 csv.writer 是否指定了 lineterminator='\\n'"
+            )
+    print(f"  行尾自检通过（无 CR）")
 
     return ad_path, target_path
 
@@ -277,7 +291,7 @@ def gen_bid_requests(count, out_dir, seed=SEED + 1):
     rng = random.Random(seed)
     path = os.path.join(out_dir, "bid_request_sample.csv")
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
+        w = csv.writer(f, lineterminator="\n")
         w.writerow(["slot_code", "region", "age", "gender", "interests"])
         for _ in range(count):
             slot = weighted_pick(rng, SLOTS)

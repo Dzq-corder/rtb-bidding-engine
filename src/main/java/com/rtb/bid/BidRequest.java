@@ -16,11 +16,17 @@ public class BidRequest {
     /** 地域编码，如 110000 */
     private String region;
 
-    /** 用户年龄 */
+    /**
+     * 年龄段，映射到 ad_target.dim_type=2 的取值。
+     * 传原始年龄（如 28）由服务端换算成 25-30，避免调用方各写一套映射。
+     */
     private Integer age;
 
     /** 1 男 2 女 0 未知 */
     private Integer gender;
+
+    /** 年龄段，直接传 ad_target 的原值时优先于此字段 */
+    private String ageBucket;
 
     /** 兴趣标签，逗号分隔 */
     private String interests;

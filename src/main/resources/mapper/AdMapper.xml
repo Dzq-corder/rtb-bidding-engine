@@ -5,22 +5,37 @@
 <mapper namespace="com.rtb.ad.AdMapper">
 
   <!--
-    M1 候选检索：朴素实现
-    ===
-    只按最基础的条件过滤，不加任何优化手段：
-      - status 上不建索引（建了就变 range，baseline 失去对照价值）
-      - 无覆盖索引（SELECT 列表都包含在主键外，无法 Using index）
-      - 不加 SQL hint、不用 FORCE INDEX
+    M1 候选检索：ad 全表扫 + ad_target 多维 JOIN
+    ==============================================
+    预期执行计划（建 sql/m1_indexes.sql 后）：
+      ad             type: ALL  | key: NULL        刻意保留，baseline 的「慢」在这
+      t1/t2/t3       type: ref  | key: idx_dim_lookup
 
-    预期执行计划（已在 M0 验证）：
-      type: ALL | key: NULL | rows: 496462 | Extra: Using where
+    为什么 ad 不建索引：
+      候选集要小（100~200 条）就得有多维定向条件，
+      而检索要足够慢才能让 M2 有对照价值。
+      分工解决：ad 承担「慢」，ad_target 承担「筛得准」。
+
+    为什么用 <if> 拼 JOIN 而不用别的写法：
+      语义直白，面试时可以逐段讲清楚「哪一段是 M2 要换掉的」。
   -->
-  <select id="findActiveByCategory" resultType="com.rtb.ad.Ad">
-    SELECT id, advertiser_id, title, creative_url, category_code,
-           bid, daily_budget, status, created_at, updated_at
-    FROM ad
-    WHERE status = 1
-      AND category_code = #{categoryCode}
+  <select id="findCandidates" resultType="com.rtb.ad.Ad">
+    SELECT a.id, a.advertiser_id, a.title, a.creative_url, a.category_code,
+           a.bid, a.daily_budget, a.status, a.created_at, a.updated_at
+    FROM ad a
+    <if test="region != null">
+      JOIN ad_target t1 ON t1.ad_id = a.id AND t1.dim_type = 1 AND t1.dim_value = #{region}
+    </if>
+    <if test="ageBucket != null">
+      JOIN ad_target t2 ON t2.ad_id = a.id AND t2.dim_type = 2 AND t2.dim_value = #{ageBucket}
+    </if>
+    <if test="gender != null">
+      JOIN ad_target t3 ON t3.ad_id = a.id AND t3.dim_type = 3 AND t3.dim_value = #{gender}
+    </if>
+    WHERE a.status = 1
+    <if test="categoryCode != null">
+      AND a.category_code = #{categoryCode}
+    </if>
   </select>
 
   <select id="countActive" resultType="long">

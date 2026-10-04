@@ -77,25 +77,47 @@ public class BidController {
      *
      * <p>分布直接对齐造数脚本的词表与权重，保证演示时看到的
      * 候选数/过滤数比例是可复现的。
+     *
+     * <p>地域权重按造数脚本的 REGIONS 人口权重分配，
+     * 性别按 5:5 拆分，类目按 Zipf 权重——不是均匀随机。
      */
     private BidRequest randomRequest() {
         String[] regions = {"110000", "310000", "440100", "440300", "330100",
                 "320100", "510100", "420100", "610100", "370200"};
+        int[] regionWeights = {50, 48, 45, 40, 36, 35, 33, 32, 28, 26};
         int[] ages = {24, 28, 32, 35, 40, 45, 52, 26, 30, 38};
         String[] categories = {"mobile", "fitness", "home", "beauty", "education",
                 "auto", "food", "finance", "game", "travel"};
+        int[] categoryWeights = {180, 130, 95, 75, 60, 48, 40, 34, 29, 25};
         String[] slots = {"feed_top", "feed_mid", "feed_bottom"};
-        String[] interests = {"运动健身", "美妆护肤", "数码科技", "美食探店",
-                "游戏电竞", "家居生活", "旅游出游"};
+        String[] interests = {"数码科技", "美妆护肤", "运动健身", "美食探店",
+                "游戏电竞", "家居生活", "旅行出游"};
 
         var rnd = ThreadLocalRandom.current();
         BidRequest req = new BidRequest();
         req.setSlotCode(slots[rnd.nextInt(slots.length)]);
-        req.setRegion(regions[rnd.nextInt(regions.length)]);
+        req.setRegion(regions[pickWeighted(rnd, regionWeights)]);
         req.setAge(ages[rnd.nextInt(ages.length)]);
-        req.setGender(rnd.nextInt(10) < 5 ? 1 : 2);
+        req.setGender(rnd.nextInt(100) < 50 ? 1 : 2);
         req.setInterests(interests[rnd.nextInt(interests.length)]);
-        req.setCategoryCode(categories[rnd.nextInt(categories.length)]);
+        req.setCategoryCode(categories[pickWeighted(rnd, categoryWeights)]);
         return req;
+    }
+
+    /** 按权重抽下标，权重量级（如 180 表示 18%）不影响相对比例 */
+    private static int pickWeighted(ThreadLocalRandom rnd, int[] weights) {
+        int total = 0;
+        for (int w : weights) {
+            total += w;
+        }
+        int r = rnd.nextInt(total);
+        int acc = 0;
+        for (int i = 0; i < weights.length; i++) {
+            acc += weights[i];
+            if (r < acc) {
+                return i;
+            }
+        }
+        return weights.length - 1;
     }
 }

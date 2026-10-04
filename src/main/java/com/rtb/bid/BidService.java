@@ -65,18 +65,26 @@ public class BidService {
         String requestId = UUID.randomUUID().toString().replace("-", "");
 
         // ---------------------------------------------------------
-        // ① 候选检索：全表扫描，无索引
+        // ① 候选检索：ad 全表扫 + ad_target 多维 JOIN
+        //
+        // ad 表刻意不建索引（承担 baseline 的「慢」），
+        // ad_target 建 idx_dim_lookup（承担「筛得准」）。
+        // M2 会把整个求交挪到内存 BitSet，对比就来自这一处。
         // ---------------------------------------------------------
         long tCand = System.nanoTime();
-        List<Ad> candidates = adMapper.findActiveByCategory(req.getCategoryCode());
+        List<Ad> candidates = adMapper.findCandidates(
+                req.getRegion(),
+                TargetingMapper.resolveAgeBucket(req.getAge(), req.getAgeBucket()),
+                TargetingMapper.toGender(req.getGender()),
+                req.getCategoryCode());
         long tCandEnd = System.nanoTime();
         int candidateCost = ms(tCand, tCandEnd);
 
         // ---------------------------------------------------------
         // ② 定向过滤
         // ---------------------------------------------------------
-        // M1 不做定向匹配：倒排表 ad_target 在这个阶段没有索引，
-        // 查它反而比不查更慢。定向匹配能力由 M2 的倒排求交提供。
+        // M1 的定向匹配已经在候选检索的 SQL JOIN 里做完了（体现为 candidateCnt）。
+        // 这一段在 M1 里是应用层拷贝，M2 起倒排求交后两者的边界会重新划分。
         long tFilter = System.nanoTime();
         List<Ad> matched = new ArrayList<>(candidates);
         long tFilterEnd = System.nanoTime();
