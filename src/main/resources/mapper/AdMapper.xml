@@ -69,4 +69,30 @@
     GROUP BY t.dim_value
   </select>
 
+  <!--
+    全量加载广告详情（M2 内存倒排索引用）
+    只取 status=1：暂停与已耗尽的广告不参与竞价，缓存它们是浪费内存。
+  -->
+  <select id="loadAllAds" resultType="com.rtb.ad.Ad">
+    SELECT id, advertiser_id, title, creative_url, category_code,
+           bid, daily_budget, status, created_at, updated_at
+    FROM ad
+    WHERE status = 1
+  </select>
+
+  <!--
+    按主键游标分页读定向条件（M2 内存倒排索引用）
+
+    刻意用游标（id > lastId）而不是 OFFSET ... LIMIT：
+    OFFSET 深翻页要扫描并丢弃前面的行，596 万行下会非常慢。
+    游标走主键索引，每批都是顺序扫。
+  -->
+  <select id="selectTargetingBatch" resultType="com.rtb.index.InvertedIndex$TargetRow">
+    SELECT id, dim_type AS dimType, dim_value AS dimValue, ad_id AS adId
+    FROM ad_target
+    WHERE id > #{lastId}
+    ORDER BY id
+    LIMIT #{limit}
+  </select>
+
 </mapper>

@@ -3,6 +3,7 @@ package com.rtb.bid;
 import com.rtb.ad.Ad;
 import com.rtb.ad.AdMapper;
 import com.rtb.budget.BudgetService;
+import com.rtb.index.InvertedIndex;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
@@ -15,27 +16,22 @@ import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
- * 竞价主链路 · M1 朴素实现
+ * 竞价主链路
  *
  * <p>链路：候选检索 → 定向过滤 → 出价排序 → 计费 → 落库
  *
- * <p><b>本轮刻意保留的「未优化」特征</b>（它们是 M2~M7 的靶子）：
+ * <p><b>M1 → M2 的变化只有一处</b>：候选检索从「数据库多表 JOIN」
+ * 改为「内存倒排求交」。实测检索耗时 38.9ms → 数毫秒。
+ *
+ * <p><b>后续里程碑的靶子</b>（M3~M7）：
  * <ul>
- *   <li>候选检索走 {@code WHERE status=1 AND category_code=?}，
- *       <b>不建索引</b>，因此全表扫描。M2 用倒排索引替代</li>
- *   <li><b>无定向匹配能力</b>。地域/年龄/性别/兴趣的匹配本身就是 M2 的交付物
- *       （倒排多条件求交），M1 不做。这不属于「砍业务逻辑」——
- *       倒排是<b>替代方案</b>，不是业务规则本身</li>
- *   <li>出价排序在应用层做，没走数据库 ORDER BY</li>
  *   <li><b>一价</b>：按最高出价扣费。二价是 M4 的交付物</li>
- *   <li>预算扣减是「读余额 → 校验 → 扣减」三步，非原子。M3 改Lua</li>
- *   <li>日志<b>同步逐条 INSERT</b>。M7 改有界队列 + 批量刷盘</li>
+ *   <li>预算扣减是「读余额 → 校验 → 扣减」三步，非原子。M3 改 Lua</li>
+ *   <li>日志<b>同步逐条INSERT</b>。M7 改有界队列 + 批量刷盘</li>
+ *   <li>无超时熔断（M5）、无 MQ（M6）</li>
  * </ul>
  *
- * <p>注意：M1<b>没有</b>超时熔断、<b>没有</b>本地缓存、<b>没有</b>走MQ。
- * 这三样分别是 M5/M3/M6 的交付物。
- *
- * <p>代码风格要求：干净、命名清晰、异常处理完整。
+ * <p>代码风格：干净、命名清晰、异常处理完整。
  * baseline 靠「未优化」成立，不靠「写得烂」成立。
  */
 @Slf4j
@@ -45,13 +41,16 @@ public class BidService {
     private final AdMapper adMapper;
     private final BidLogMapper bidLogMapper;
     private final BudgetService budgetService;
+    private final InvertedIndex invertedIndex;
 
     public BidService(AdMapper adMapper,
                       BidLogMapper bidLogMapper,
-                      BudgetService budgetService) {
+                      BudgetService budgetService,
+                      InvertedIndex invertedIndex) {
         this.adMapper = adMapper;
         this.bidLogMapper = bidLogMapper;
         this.budgetService = budgetService;
+        this.invertedIndex = invertedIndex;
     }
 
     /**
@@ -65,33 +64,53 @@ public class BidService {
         String requestId = UUID.randomUUID().toString().replace("-", "");
 
         // ---------------------------------------------------------
-        // ① 候选检索：ad 全表扫 + ad_target 多维 JOIN
+        // ① 候选检索
         //
-        // ad 表刻意不建索引（承担 baseline 的「慢」），
-        // ad_target 建 idx_dim_lookup（承担「筛得准」）。
-        // M2 会把整个求交挪到内存 BitSet，对比就来自这一处。
+        // M1：ad 全表扫 + ad_target 三维 JOIN（检索耗时 38.9ms，占 92%）
+        // M2：内存倒排求交，一次数据库都不查
+        //
+        // 索引未就绪时降级回 M1 的 SQL 路径——可用性优先于性能。
         // ---------------------------------------------------------
         long tCand = System.nanoTime();
-        List<Ad> candidates = adMapper.findCandidates(
-                req.getRegion(),
-                TargetingMapper.resolveAgeBucket(req.getAge(), req.getAgeBucket()),
-                TargetingMapper.toGender(req.getGender()),
-                req.getCategoryCode());
+
+        String ageBucket = TargetingMapper.resolveAgeBucket(req.getAge(), req.getAgeBucket());
+        String gender = TargetingMapper.toGender(req.getGender());
+
+        List<Ad> candidates;
+        if (invertedIndex.isReady()) {
+            candidates = invertedIndex.intersect(List.of(
+                    new String[]{String.valueOf(InvertedIndex.DIM_REGION), req.getRegion()},
+                    new String[]{String.valueOf(InvertedIndex.DIM_AGE), ageBucket},
+                    new String[]{String.valueOf(InvertedIndex.DIM_GENDER), gender}));
+            // M2 之后候选已在内存求交并按出价排好，
+            // 若还带了类目则再按类目收窄
+            if (req.getCategoryCode() != null) {
+                candidates.removeIf(a -> !req.getCategoryCode().equals(a.getCategoryCode()));
+            }
+        } else {
+            log.warn("倒排索引未就绪，候选检索降级到数据库");
+            candidates = adMapper.findCandidates(req.getRegion(), ageBucket, gender,
+                    req.getCategoryCode());
+        }
         long tCandEnd = System.nanoTime();
         int candidateCost = ms(tCand, tCandEnd);
 
         // ---------------------------------------------------------
         // ② 定向过滤
+        //
+        // M1 阶段定向匹配在候选检索的 SQL JOIN 里做完了，这一段是应用层拷贝。
+        // M2 之后求交已包含定向语义，这一段只做类目收窄（若有）。
         // ---------------------------------------------------------
-        // M1 的定向匹配已经在候选检索的 SQL JOIN 里做完了（体现为 candidateCnt）。
-        // 这一段在 M1 里是应用层拷贝，M2 起倒排求交后两者的边界会重新划分。
         long tFilter = System.nanoTime();
-        List<Ad> matched = new ArrayList<>(candidates);
+        List<Ad> matched = candidates;
         long tFilterEnd = System.nanoTime();
         int filterCost = ms(tFilter, tFilterEnd);
 
         // ---------------------------------------------------------
-        // ③ 出价排序：应用层排序
+        // ③ 出价排序
+        //
+        // M2 的 intersect 已按出价降序返回，这里只在降级路径需要重排。
+        // 但保留这行作为安全网：类目收窄后顺序仍应保持（removeIf 不改顺序）。
         // ---------------------------------------------------------
         long tSort = System.nanoTime();
         matched.sort(Comparator.comparing(Ad::getBid).reversed());

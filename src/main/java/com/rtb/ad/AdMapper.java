@@ -62,4 +62,21 @@ public interface AdMapper {
      * 测出来的分布与真实流量不符。按命中数加权后才一致。
      */
     List<Map<String, Object>> countTargetingValues(@Param("dimTypes") List<Integer> dimTypes);
+
+    /**
+     * 全量加载广告详情，供内存倒排索引常驻缓存。
+     *
+     * <p>一次返回 50 万条——对象本身约 50MB，可接受。
+     * 若数据量再涨一个数量级，应改为分批加载。
+     */
+    List<Ad> loadAllAds();
+
+    /**
+     * 按主键游标分页读取定向条件，供 M2 内存倒排索引构建。
+     *
+     * <p>用游标（WHERE id > lastId）而不是 OFFSET 分页：
+     * OFFSET 在深翻页时要扫描并丢弃前面的行，596 万行下会非常慢。
+     */
+    List<com.rtb.index.InvertedIndex.TargetRow> selectTargetingBatch(@Param("lastId") long lastId,
+                                                                    @Param("limit") int limit);
 }
