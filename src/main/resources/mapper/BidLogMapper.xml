@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.rtb.bid.BidLogMapper">
+
+  <!--
+    M1 写入：朴素实现，单条 INSERT
+    ------------------------------
+    每笔竞价同步写一行。业务逻辑正确，只是没有任何写入优化。
+    M7 会改为本地有界队列 + 批量刷盘（攒 500 条或 200ms 触发）。
+
+    注意：不使用 ON DUPLICATE KEY UPDATE。
+    bid_log 的 uk_request 是幂等键，但 M1 阶段一个 request_id 只写一次，
+    幂等消费是 M6 Kafka 旁路的职责，两者不要混。
+  -->
+  <insert id="insert" parameterType="com.rtb.bid.BidLog"
+          useGeneratedKeys="true" keyProperty="id">
+    INSERT INTO bid_log (
+      request_id, ad_id, advertiser_id, slot_code,
+      region, age, gender, interests,
+      candidate_cnt, match_cnt, has_ad, win_bid, pay_price,
+      cost_ms, candidate_cost, filter_cost, sort_cost, bill_cost,
+      bid_at
+    ) VALUES (
+      #{requestId}, #{adId}, #{advertiserId}, #{slotCode},
+      #{region}, #{age}, #{gender}, #{interests},
+      #{candidateCnt}, #{matchCnt}, #{hasAd}, #{winBid}, #{payPrice},
+      #{costMs}, #{candidateCost}, #{filterCost}, #{sortCost}, #{billCost},
+      #{bidAt}
+    )
+  </insert>
+
+  <!--
+    以下统计仅用于 baseline 采集与演示看板，不加索引。
+    大表上的这类查询正是 M8 第 1 轮（覆盖索引）与第 3 轮（分区裁剪）的靶子：
+    现在走全表扫描 + Using temporary，M8 之后变成 Using index + 只扫命中分区。
+  -->
+  <select id="countHasAd" resultType="long">
+    SELECT COUNT(*) FROM bid_log WHERE has_ad = 1
+  </select>
+
+  <select id="countAll" resultType="long">
+    SELECT COUNT(*) FROM bid_log
+  </select>
+
+</mapper>

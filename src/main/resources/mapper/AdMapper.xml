@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.rtb.ad.AdMapper">
+
+  <!--
+    M1 候选检索：朴素实现
+    -------------------
+    只按最基础的条件过滤，不加任何优化手段：
+      - status 上不建索引（建了就变 range，baseline 失去对照价值）
+      - 无覆盖索引（SELECT 列表都包含在主键外，无法 Using index）
+      - 不加 SQL hint、不用 FORCE INDEX
+
+    预期执行计划（已在 M0 验证）：
+      type: ALL | key: NULL | rows: 496462 | Extra: Using where
+  -->
+  <select id="findActiveByCategory" resultType="com.rtb.ad.Ad">
+    SELECT id, advertiser_id, title, creative_url, category_code,
+           bid, daily_budget, status, created_at, updated_at
+    FROM ad
+    WHERE status = 1
+      AND category_code = #{categoryCode}
+  </select>
+
+  <select id="countActive" resultType="long">
+    SELECT COUNT(*) FROM ad WHERE status = 1
+  </select>
+
+</mapper>
