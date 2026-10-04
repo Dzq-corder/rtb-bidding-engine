@@ -37,16 +37,16 @@ USE rtb;
 -- ---------------------------------------------------------------------
 DROP TABLE IF EXISTS ad;
 CREATE TABLE ad (
-  id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  advertiser_id INT UNSIGNED    NOT NULL COMMENT '广告主 ID',
-  title         VARCHAR(128)    NOT NULL COMMENT '创意标题，由行业前缀 x 品牌词 x 产品词组合',
+  id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+  advertiser_id INT UNSIGNED    NOT NULL COMMENT '广告主 ID，关联 ad.advertiser_id',
+  title       VARCHAR(128)    NOT NULL COMMENT '创意标题，由行业前缀 x 品牌词 x 产品词组合',
   creative_url  VARCHAR(255)    NOT NULL COMMENT '素材地址',
   category_code VARCHAR(32)     NOT NULL COMMENT '行业类目，Zipf 分布',
   bid           DECIMAL(10,2)   NOT NULL COMMENT '出价，单位元，对数正态长尾',
   daily_budget  DECIMAL(12,2)   NOT NULL COMMENT '日预算，离散档位',
   status        TINYINT         NOT NULL DEFAULT 1 COMMENT '1在投 2暂停 3已耗尽',
-  created_at    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_at    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  updated_at    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '最后修改时间，随UPDATE 自动更新',
   PRIMARY KEY (id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='在投广告';
 
@@ -64,11 +64,12 @@ CREATE TABLE ad (
 -- ---------------------------------------------------------------------
 DROP TABLE IF EXISTS ad_target;
 CREATE TABLE ad_target (
-  id        BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  ad_id     BIGINT UNSIGNED NOT NULL COMMENT '广告 ID',
+  id        BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+  ad_id     BIGINT UNSIGNED NOT NULL COMMENT '广告 ID，关联 ad.id',
   dim_type  TINYINT         NOT NULL COMMENT '1地域 2年龄段 3性别 4兴趣 5系统 6设备',
-  dim_value VARCHAR(64)     NOT NULL COMMENT '定向值，如 110000 / 25-34 / male / 运动',
-  PRIMARY KEY (id)
+  dim_value VARCHAR(64)     NOT NULL COMMENT '定向值，如 110000 / 25-30 / male / 数码科技',
+  PRIMARY KEY (id),
+  KEY idx_dim_lookup (dim_type, dim_value, ad_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='定向条件倒排';
 
 -- ---------------------------------------------------------------------
@@ -83,10 +84,10 @@ CREATE TABLE ad_target (
 -- ---------------------------------------------------------------------
 DROP TABLE IF EXISTS bid_log;
 CREATE TABLE bid_log (
-  id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键',
   request_id     CHAR(32)        NOT NULL COMMENT '竞价请求唯一 ID，同时是幂等键',
   ad_id          BIGINT UNSIGNED          DEFAULT NULL COMMENT '胜出广告 ID，has_ad=0 时为 NULL',
-  advertiser_id  INT UNSIGNED             DEFAULT NULL COMMENT '胜出广告主 ID',
+  advertiser_id  INT UNSIGNED             DEFAULT NULL COMMENT '胜出广告主 ID，has_ad=0 时为 NULL',
   slot_code      VARCHAR(32)     NOT NULL COMMENT '广告位',
   -- 请求上下文（用户画像）
   region         VARCHAR(16)     NOT NULL COMMENT '地域编码',
@@ -122,16 +123,16 @@ CREATE TABLE bid_log (
 -- ---------------------------------------------------------------------
 DROP TABLE IF EXISTS billing_event;
 CREATE TABLE billing_event (
-  id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键',
   event_id       CHAR(32)        NOT NULL COMMENT '事件唯一 ID，消费端幂等键',
-  request_id     CHAR(32)        NOT NULL COMMENT '来源竞价请求 ID',
-  ad_id          BIGINT UNSIGNED NOT NULL,
-  advertiser_id  INT UNSIGNED    NOT NULL,
+  request_id     CHAR(32)        NOT NULL COMMENT '来源竞价请求 ID，关联 bid_log.request_id',
+  ad_id          BIGINT UNSIGNED NOT NULL COMMENT '广告 ID，关联 ad.id',
+  advertiser_id  INT UNSIGNED    NOT NULL COMMENT '广告主 ID，关联 ad.advertiser_id',
   bid_price      DECIMAL(10,2)   NOT NULL COMMENT '胜出出价',
   pay_price      DECIMAL(10,2)   NOT NULL COMMENT '实际扣费',
-  second_price   DECIMAL(10,2)            DEFAULT NULL COMMENT '次高价，二价结算依据',
-  is_second_price TINYINT        NOT NULL DEFAULT 0 COMMENT '1二价 0一价（M1 阶段）',
-  billed_at      DATETIME(3)     NOT NULL,
+  second_price   DECIMAL(10,2)            DEFAULT NULL COMMENT '次高价，二价结算依据；一价时为 NULL',
+  is_second_price TINYINT        NOT NULL DEFAULT 0 COMMENT '1二价 0一价（M1 阶段恒为 0）',
+  billed_at      DATETIME(3)     NOT NULL COMMENT '计费时间，M8-3 按此字段做 RANGE 分区',
   PRIMARY KEY (id),
   UNIQUE KEY uk_event (event_id),
   KEY idx_advertiser_time (advertiser_id, billed_at)
