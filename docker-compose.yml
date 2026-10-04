@@ -1,0 +1,131 @@
+# RTB 投放引擎 · 中间件环境
+#
+# 用法：docker compose up -d     启动三个中间件
+#      docker compose ps        确认三个都是 healthy
+#      docker compose down      停止（保留数据卷）
+#      docker compose down -v   停止并删除数据卷（会清空数据，慎用）
+#
+# 约定：中间件由人工启动，本项目不提供自动起容器的脚本。
+#       服务本身跑在宿主：mvn spring-boot:run 或 java -jar target/*.jar
+#
+# 启动前请确认 Docker Desktop 内存分配 >= 8GB：
+#       MySQL 装 1000 万行 + Kafka JVM + 宿主 JVM 同时运行，2GB 会 OOM。
+
+name: rtb
+
+services:
+
+  # ---------------------------------------------------------------------
+  # MySQL 8.0 —— 广告/定向/竞价明细/计费事件/小时汇总
+  # 只用于本地演示，不设密码。切勿用于任何非本地环境。
+  # ---------------------------------------------------------------------
+  mysql:
+    image: mysql:8.0
+    container_name: rtb-mysql
+    restart: unless-stopped
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+      MYSQL_ROOT_HOST: "%"
+      MYSQL_DATABASE: rtb
+      # 造数需要 LOAD DATA LOCAL INFILE，MySQL 8 默认关闭
+      LANG: C.UTF-8
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --local-infile=1
+      - --max-connections=500
+      - --innodb-buffer-pool-size=512M
+      # 导入/查询期间减少刷盘抖动，压测数据更稳定
+      - --innodb-flush-log-at-trx-commit=2
+      - --slow-query-log=1
+      - --long-query-time=0.1
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+
+  # ---------------------------------------------------------------------
+  # Redis 7 —— 预算余额 / Lua 原子扣减 / 频次与反作弊中间态
+  # 本地演示不设密码。
+  # ---------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: rtb-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command:
+      - redis-server
+      - --appendonly
+      - "no"
+      - --save
+      - ""
+      # 预聚合结果落到 MySQL，Redis 只做实时态，持久化意义不大；
+      # 关掉持久化可减少压测时的磁盘抖动
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - noeviction
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  # ---------------------------------------------------------------------
+  # Kafka 3.7 —— 竞价事件旁路（bid_event 主题，3 个消费组）
+  #
+  # 官方 apache/kafka 镜像是纯 KRaft 模式，不依赖 Zookeeper。
+  #
+  # 关键配置：ADVERTISED_LISTENERS 必须写成 localhost。
+  #   容器内的 Broker 启动时会把自己的地址广播给客户端；若广播的是容器
+  #   内部主机名，宿主上的应用拿到这个地址后无法连接，会报
+  #   "Connection to node -1 could not be established"。
+  #   这是用 Docker 跑 Kafka 最常见的坑。
+  #
+  # 单节点副本因子必须为 1：只有 1 个 Broker 时，副本因子 > 1 的主题
+  # 无法分配 leader，topic 创建会失败或写入报 NOT_ENOUGH_REPLICAS。
+  # ---------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: rtb-kafka
+    restart: unless-stopped
+    ports:
+      - "9092:9092"
+    environment:
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://localhost:9092"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@localhost:9093"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      # 单节点：以下三项必须为 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      # 压测会产生大量事件，给足日志分段，减少磁盘争抢
+      KAFKA_LOG_SEGMENT_BYTES: "268435456"
+      KAFKA_HEAP_OPTS: "-Xmx768M -Xms256M"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 8
+      start_period: 30s
+
+volumes:
+  mysql-data:
+  kafka-data:
