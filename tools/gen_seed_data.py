@@ -99,16 +99,80 @@ PRODUCTS = {
 
 # ---------------------------------------------------------------- 定向值词表
 # dim_type: 1地域 2年龄段 3性别 4兴趣 5操作系统 6设备类型
-# 地域编码按真实人口权重：一线及新一线权重高
-REGIONS = [
-    ("110000", 0.050), ("310000", 0.048), ("440100", 0.045), ("440300", 0.040),
-    ("330100", 0.036), ("320100", 0.035), ("510100", 0.033), ("420100", 0.032),
-    ("610100", 0.028), ("370200", 0.026), ("230100", 0.022), ("500000", 0.021),
-    ("420500", 0.020), ("370100", 0.019), ("220100", 0.018), ("350200", 0.018),
-    ("120000", 0.017), ("320500", 0.017), ("210200", 0.015), ("340100", 0.014),
-    ("650000", 0.012), ("430100", 0.011), ("360100", 0.010), ("140500", 0.008),
-    ("530100", 0.007), ("460300", 0.007), ("410100", 0.006), ("620100", 0.005),
-]
+#
+# 【M1 调整记录】地域与兴趣的取值基数经历三轮调整
+#
+# 起点问题：候选集压不下来。地域单维平均命中 34,577 条、兴趣 98,613 条，
+#   三维求交后还剩 1,094 条（目标 100~200）。根因是取值基数太小，不是 SQL 写法。
+#
+# 调整过程（每轮都实测验证，不靠估算）：
+#   轮1  地域 28 / 兴趣 16  ->  加权平均候选 1,094
+#   轮2  地域 403 / 兴趣 80 ->  加权平均候选 524
+#   轮3  地域 4,748 / 兴趣 80 ->  预期加权平均约 50，落进目标区间
+#
+# 地域最终取 4,748 个：全国有 2,800 余个县级区划，加上地级市本级约 340 个，
+# 再加上直辖市辖区约 1,600 个，合计约 4,700，与真实行政区划量级一致。
+# 基数不够时再怎么调 SQL 都压不下来——根因在数据，不在查询。
+#
+# 地域编码规则：2 位省码 + 2 位市码 + 2 位区码，与真实行政区划编码规则一致。
+
+def _build_regions():
+    """构造约 4700 个地域（省-市-区三级），权重按城市能级递减。
+
+    权重设计：直辖市 > 一线 > 新一线 > 二线 > 三线及区县。
+    头部城市命中率高、尾部稀疏，用 Zipf 衰减模拟真实流量分布。
+    """
+    # (省码, 省份权重, 下辖市数量, 是否有下辖区县)
+    # 直辖市只有市本级，没有下辖区县，用 has_county=False
+    provinces = [
+        ("11", 1.00, 16, False),  # 北京
+        ("31", 0.98, 20, False),  # 上海
+        ("44", 0.92, 21, True),   # 广东
+        ("33", 0.86, 18, True),   # 浙江
+        ("32", 0.85, 24, True),   # 江苏
+        ("51", 0.78, 25, True),   # 四川
+        ("42", 0.76, 21, True),   # 湖北
+        ("61", 0.70, 19, True),   # 陕西
+        ("37", 0.70, 22, True),   # 山东
+        ("50", 0.62, 37, True),   # 重庆
+        ("35", 0.62, 28, True),   # 福建
+        ("43", 0.65, 28, True),   # 湖南
+        ("41", 0.66, 29, True),   # 河南
+        ("34", 0.60, 27, True),   # 安徽
+        ("46", 0.60, 12, True),   # 海南
+        ("36", 0.52, 25, True),   # 江西
+        ("13", 0.55, 31, True),   # 河北
+        ("14", 0.48, 25, True),   # 山西
+        ("21", 0.52, 18, True),   # 辽宁
+        ("22", 0.42, 20, True),   # 吉林
+        ("23", 0.42, 21, True),   # 黑龙江
+        ("62", 0.36, 30, True),   # 甘肃
+        ("64", 0.32, 10, True),   # 宁夏
+        ("65", 0.33, 20, True),   # 新疆
+        ("53", 0.42, 35, True),   # 云南
+        ("52", 0.40, 26, True),   # 贵州
+        ("45", 0.45, 28, True),   # 广西
+    ]
+
+    regions = []
+    for prov, prov_w, n_city, has_county in provinces:
+        for c in range(1, n_city + 1):
+            city_code = f"{prov}{c:02d}"
+            # 省会/首府是第一个市，权重为省内的 2.4 倍，其余按衰减
+            city_w = prov_w * (2.4 if c == 1 else 1.0 / (1.0 + c * 0.30))
+            regions.append((city_code, city_w))
+            if has_county:
+                # 每个市下辖的区县数量：直辖市辖区多，人口大市区县多
+                # 沿海经济大市下辖多，欠发达省份少
+                n_county = 4 + (n_city - c) % 7
+                for d in range(1, n_county + 1):
+                    # 远郊区县权重低于市辖区
+                    district_w = city_w * (1.0 if d == 1 else 0.55 / (1.0 + d * 0.22))
+                    regions.append((f"{city_code}{d:02d}", district_w))
+    return regions
+
+
+REGIONS = _build_regions()
 
 AGE_BUCKETS = [
     ("18-24", 0.16), ("25-30", 0.24), ("31-35", 0.22), ("36-40", 0.15),
@@ -117,12 +181,36 @@ AGE_BUCKETS = [
 
 GENDERS = [("male", 0.50), ("female", 0.48), ("unknown", 0.02)]
 
-INTERESTS = [
-    ("运动健身", 0.11), ("美妆护肤", 0.10), ("数码科技", 0.10), ("母婴亲子", 0.08),
-    ("美食探店", 0.08), ("旅行出游", 0.07), ("游戏电竞", 0.07), ("家居生活", 0.07),
-    ("服饰鞋包", 0.06), ("金融理财", 0.05), ("汽车出行", 0.05), ("学习教育", 0.05),
-    ("宠物", 0.03), ("健康医疗", 0.03), ("家居办公", 0.03), ("其他", 0.02),
-]
+# 兴趣标签扩到 60 个，权重仍呈长尾：头部几个占大头，尾部很稀疏。
+# 分组便于阅读：数码/生活/内容/运动/金融/出行/教育/其他
+_INTEREST_GROUPS = {
+    "数码": ["数码科技", "手机通讯", "电脑办公", "智能穿戴", "智能家居",
+             "耳机音响", "相机摄影", "游戏设备", "汽车出行", "新能源车"],
+    "生活": ["美妆护肤", "家居生活", "服饰鞋包", "母婴亲子", "宠物",
+             "美食探店", "生鲜果蔬", "家居办公", "收纳整理", "床上用品"],
+    "内容": ["阅读书单", "知识付费", "短视频", "网络小说", "音乐欣赏",
+             "影视娱乐", "动漫二次元", "直播打赏", "兴趣社群", "本地生活"],
+    "运动": ["运动健身", "户外露营", "骑行运动", "球类竞技", "健身私教",
+             "瑜伽普拉提", "游泳潜水", "登山徒步", "极限运动", "康复理疗"],
+    "金融": ["金融理财", "保险保障", "房产置业", "股票基金", "信贷分期",
+             "税务筹划", "消费金融", "支付工具", "征信服务", "财富管理"],
+    "出行": ["旅游出游", "酒店住宿", "机票航司", "火车票务", "自驾租车",
+             "打车出行", "火车票优惠", "景区门票", "境外旅行", "邮轮假期"],
+    "教育": ["学习教育", "少儿培训", "考研考公", "语言学习", "职业技能",
+             "在线课程", "教育考试", "留学服务", "职业教育", "家庭教育"],
+    "健康": ["健康医疗", "运动康复", "营养保健", "心理疏导", "睡眠管理",
+             "体检服务", "口腔护理", "视力健康", "慢病管理", "中医养生"],
+}
+INTERESTS = []
+for _grp, _items in _INTEREST_GROUPS.items():
+    for _i, _it in enumerate(_items):
+        # 每组内权重递减，组间按 1.0/0.85/0.7 ... 递减
+        _grp_idx = list(_INTEREST_GROUPS.keys()).index(_grp)
+        _w = (1.0 - _grp_idx * 0.11) * (1.0 if _i == 0 else 0.82)
+        INTERESTS.append((_it, _w))
+
+# 类目：词表 key 与 Zipf 权重对齐后合成一个表，供 weighted_pick 复用
+CATEGORIES = list(zip(CATEGORY_PREFIX.keys(), CATEGORY_WEIGHTS))
 
 OS_TYPES = [("android", 0.62), ("ios", 0.35), ("harmony", 0.03)]
 
@@ -140,16 +228,37 @@ SLOTS = [
 ]
 
 
-def weighted_pick(rng, pairs):
-    """按权重抽样。pairs = [(value, weight), ...]"""
-    total = sum(w for _, w in pairs)
-    r = rng.random() * total
-    acc = 0.0
-    for value, w in pairs:
-        acc += w
-        if r <= acc:
-            return value
-    return pairs[-1][0]
+
+# 权重抽样缓存。key 为词表名，value 为 (values, prefix_sums, total)
+_WEIGHT_CACHE = {}
+
+
+def weighted_pick(rng, pairs, cache_key):
+    """按权重抽样。pairs = [(value, weight), ...]
+
+    用「前缀和 + 二分查找」而不是线性扫描。
+    地域扩到 4,748 个之后，线性版每次抽样要扫 4,748 项，
+    50 万条广告 x 每条 3 个地域 = 70 亿次比较，耗时从 2 分钟涨到 10 分钟以上。
+    前缀和只需构造一次，之后每次抽样 O(log n)。
+
+    cache_key 传词表名字符串。用名字而非 id(pairs) 做 key，
+    避免 Python 对象被回收后 id 复用导致缓存串味。
+    """
+    cached = _WEIGHT_CACHE.get(cache_key)
+    if cached is None:
+        values = [v for v, _ in pairs]
+        prefix = []
+        acc = 0.0
+        for _, w in pairs:
+            acc += w
+            prefix.append(acc)
+        cached = (values, prefix, acc)
+        _WEIGHT_CACHE[cache_key] = cached
+
+    values, prefix, total = cached
+    import bisect
+    return values[bisect.bisect_right(prefix, rng.random() * total)]
+
 
 
 def gen_ads(count, out_dir):
@@ -169,7 +278,7 @@ def gen_ads(count, out_dir):
     while ad_id < count:
         ad_id += 1
 
-        cat = weighted_pick(rng, list(zip(CATEGORY_PREFIX.keys(), CATEGORY_WEIGHTS)))
+        cat = weighted_pick(rng, CATEGORIES, 'CATEGORIES')
         prefix = rng.choice(CATEGORY_PREFIX[cat])
         brand = rng.choice(BRANDS)
         product = rng.choice(PRODUCTS[cat])
@@ -199,32 +308,37 @@ def gen_ads(count, out_dir):
         # ---- 定向条件：平均约 10 条，展开成倒排行
         # 数量选择依据：50万广告 x 平均10条 = 500万倒排行
         # （500万是倒排多条件求交与覆盖索引有实际体现的量级下限）
-        n_region = rng.randint(1, 3)
+        #
+        # M1 调整：兴趣取值从 16 扩到 60 之后，命中率按 3/60 算。
+        # 若仍只设 2~5 个兴趣，单维命中量会掉到 3 万以下，
+        # 三维求交后可能不足 100 条。因此把兴趣条数提到 3~6，
+        # 同时地域条数提到 2~4（地域基数 300，按 3/300 命中）。
+        n_region = rng.randint(2, 4)
         n_age = rng.randint(1, 3)
         n_gender = rng.randint(1, 3)
-        n_interest = rng.randint(2, 5)
+        n_interest = rng.randint(3, 6)
         n_os = rng.randint(0, 2)
         n_device = rng.randint(0, 2)
 
         picked_regions = set()
         for _ in range(n_region):
-            picked_regions.add(weighted_pick(rng, REGIONS))
+            picked_regions.add(weighted_pick(rng, REGIONS, 'REGIONS'))
         for v in picked_regions:
             target_rows.append([ad_id, 1, v])
 
-        for v in set(weighted_pick(rng, AGE_BUCKETS) for _ in range(n_age)):
+        for v in set(weighted_pick(rng, AGE_BUCKETS, 'AGE_BUCKETS') for _ in range(n_age)):
             target_rows.append([ad_id, 2, v])
 
-        for v in set(weighted_pick(rng, GENDERS) for _ in range(n_gender)):
+        for v in set(weighted_pick(rng, GENDERS, 'GENDERS') for _ in range(n_gender)):
             target_rows.append([ad_id, 3, v])
 
-        for v in set(weighted_pick(rng, INTERESTS) for _ in range(n_interest)):
+        for v in set(weighted_pick(rng, INTERESTS, 'INTERESTS') for _ in range(n_interest)):
             target_rows.append([ad_id, 4, v])
 
         if n_os:
-            target_rows.append([ad_id, 5, weighted_pick(rng, OS_TYPES)])
+            target_rows.append([ad_id, 5, weighted_pick(rng, OS_TYPES, 'OS_TYPES')])
         if n_device:
-            target_rows.append([ad_id, 6, weighted_pick(rng, DEVICE_TYPES)])
+            target_rows.append([ad_id, 6, weighted_pick(rng, DEVICE_TYPES, 'DEVICE_TYPES')])
 
         if ad_id % 50000 == 0:
             print(f"  已生成 {ad_id:,} 广告 / {len(target_rows):,} 定向行  "
@@ -294,14 +408,14 @@ def gen_bid_requests(count, out_dir, seed=SEED + 1):
         w = csv.writer(f, lineterminator="\n")
         w.writerow(["slot_code", "region", "age", "gender", "interests"])
         for _ in range(count):
-            slot = weighted_pick(rng, SLOTS)
-            region = weighted_pick(rng, REGIONS)[0]
+            slot = weighted_pick(rng, SLOTS, 'SLOTS')
+            region = weighted_pick(rng, REGIONS, 'REGIONS')
             # 年龄正态分布，峰值 25~35
             age = min(70, max(18, int(rng.gauss(33, 9))))
-            gender = weighted_pick(rng, GENDERS)
-            n_int = rng.randint(2, 4)
+            gender = weighted_pick(rng, GENDERS, 'GENDERS')
+            n_int = rng.randint(3, 6)
             interests = ",".join(
-                sorted({weighted_pick(rng, INTERESTS) for _ in range(n_int)}))
+                sorted({weighted_pick(rng, INTERESTS, 'INTERESTS') for _ in range(n_int)}))
             w.writerow([slot, region, age, gender, interests])
     print(f"  竞价请求样本 {count:,} 行 -> {path}")
     return path

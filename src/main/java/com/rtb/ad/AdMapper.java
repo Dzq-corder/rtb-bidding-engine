@@ -4,7 +4,7 @@ import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 
 import java.util.List;
-
+import java.util.Map;
 /**
  * 广告 Mapper。
  *
@@ -38,4 +38,28 @@ public interface AdMapper {
      * 在投广告总数，M1 用于填充率与候选集规模的基线统计。
      */
     long countActive();
+
+    /**
+     * 读取指定维度的全部定向取值（dim_type, dim_value）。
+     *
+     * <p>用途：压测接口生成随机请求时，需要从「库里真实存在的取值」里抽样。
+     * 硬编码词表会与造数参数脱节——M1 调整地域码后，
+     * 硬编码的旧值在库中不存在，导致候选恒为 0、空广告率 100%。
+     *
+     * <p>只读一次，结果缓存在控制器里，不在每次竞价时调用。
+     *
+     * @param dimTypes 只查这些维度。ad_target 有 596 万行，全表读会拖慢启动。
+     */
+    List<Map<String, Object>> listTargetingValues(@Param("dimTypes") List<Integer> dimTypes);
+
+    /**
+     * 统计指定维度各取值的出现次数。
+     *
+     * <p>用途：压测接口按权重抽样地域。
+     * 地域有 4,748 个，但广告的地域定向按人口权重偏斜——
+     * 头部城市约 7,900 条，长尾只有几十条。
+     * 均匀随机会让 82.8% 的请求落到长尾地域，候选只剩 1~49 条，
+     * 测出来的分布与真实流量不符。按命中数加权后才一致。
+     */
+    List<Map<String, Object>> countTargetingValues(@Param("dimTypes") List<Integer> dimTypes);
 }

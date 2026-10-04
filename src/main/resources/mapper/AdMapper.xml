@@ -42,4 +42,31 @@
     SELECT COUNT(*) FROM ad WHERE status = 1
   </select>
 
+  <!--
+    读取指定维度的定向取值，供压测接口生成随机请求。
+    只查地域与兴趣两个维度：ad_target 有 596 万行，
+    全表 DISTINCT 会拖慢启动；而这两个维度才是请求里真正带的字段。
+  -->
+  <select id="listTargetingValues" resultType="java.util.LinkedHashMap">
+    SELECT dim_type AS dimType, dim_value AS dimValue
+    FROM ad_target
+    WHERE dim_type IN
+    <foreach collection="dimTypes" item="t" open="(" separator="," close=")">#{t}</foreach>
+    GROUP BY dim_type, dim_value
+  </select>
+  <!--
+    各取值的在投广告数，供压测接口做加权抽样。
+    必须 JOIN ad 且只算 status=1：倒排行数包含暂停/已耗尽广告，
+    而竞价时检索的是 status=1，用全量行数加权会高估。
+    只查指定维度，避免596 万行全表 GROUP BY 拖慢启动。
+  -->
+  <select id="countTargetingValues" resultType="java.util.LinkedHashMap">
+    SELECT t.dim_value AS dimValue, COUNT(*) AS cnt
+    FROM ad_target t
+    JOIN ad a ON a.id = t.ad_id AND a.status = 1
+    WHERE t.dim_type IN
+    <foreach collection="dimTypes" item="t" open="(" separator="," close=")">#{t}</foreach>
+    GROUP BY t.dim_value
+  </select>
+
 </mapper>
