@@ -34,6 +34,8 @@ services:
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_0900_ai_ci
+      # 造数走 LOAD DATA LOCAL INFILE：CSV 由客户端（容器内 mysql 进程）
+      # 读取后经协议传给服务端，因此不依赖 secure-file-priv 的路径白名单。
       - --local-infile=1
       - --max-connections=500
       - --innodb-buffer-pool-size=512M
@@ -43,6 +45,10 @@ services:
       - --long-query-time=0.1
     volumes:
       - mysql-data:/var/lib/mysql
+      # 造数用CSV 挂载点。不用 docker cp 往容器里塞文件：
+      # MySQL 8 镜像的 ENTRYPOINT 会重建 /tmp，导致 cp 进去的文件静默消失
+      #（表现为命令报 Copied 但 ls 看不到文件）。
+      - ./data:/data:ro
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--silent"]
       interval: 10s

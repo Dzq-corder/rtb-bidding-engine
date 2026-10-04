@@ -22,3 +22,7 @@ data/
 !sql/**/*.sql
 node_modules/
 .DS_Store
+
+# 演示数据与导入中间产物
+data/
+data_test/

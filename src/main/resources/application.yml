@@ -1,0 +1,101 @@
+server:
+  port: 8080
+  tomcat:
+    threads:
+      max: 200
+      min-spare: 20
+    accept-count: 200
+    max-connections: 8192
+
+spring:
+  application:
+    name: rtb-engine
+
+  datasource:
+    # 本地演示环境不设密码，对应 docker-compose.yml 的 MYSQL_ALLOW_EMPTY_PASSWORD
+    url: jdbc:mysql://127.0.0.1:3306/rtb?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&rewriteBatchedStatements=true
+    username: root
+    password:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      pool-name: rtbHikari
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 3000
+      validation-timeout: 2000
+      # 压测时打印的连接池指标来源
+      leak-detection-threshold: 5000
+
+  data:
+    redis:
+      host: 127.0.0.1
+      port: 6379
+      database: 0
+      # 预算扣减必须快，连接池适当放大
+      lettuce:
+        pool:
+          max-active: 32
+          max-idle: 16
+          min-idle: 4
+          max-wait: 200ms
+      timeout: 200ms
+
+  kafka:
+    bootstrap-servers: 127.0.0.1:9092
+    producer:
+      # M6 启用。acks=all 配合幂等生产者，防止事件丢失与重复
+      acks: all
+      retries: 3
+      properties:
+        enable.idempotence: true
+        linger.ms: 5
+        batch.size: 32768
+    consumer:
+      group-id: rtb-engine
+      auto-offset-reset: latest
+      enable-auto-commit: false
+      # 消费端手动提交位点，保证至少一次投递
+      max-poll-records: 500
+    listener:
+      # 手动提交，配合幂等实现「至少一次 + 最终只生效一次」
+      ack-mode: manual_immediate
+
+mybatis:
+  configuration:
+    # 展示 SQL 执行耗时，定位瓶颈用
+    log-impl: org.apache.ibatis.logging.slf4j.Slf4jImpl
+    map-underscore-to-camel-case: true
+    default-fetch-size: 100
+    default-statement-timeout: 5
+  mapper-locations: classpath:mapper/*.xml
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    tags:
+      application: rtb-engine
+  observations:
+    key-values:
+      application: rtb-engine
+
+logging:
+  level:
+    root: INFO
+    com.rtb: INFO
+    # 压测时可临时调 DEBUG 看 SQL
+    com.rtb.mapper: INFO
+  pattern:
+    console: "%d{HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n"
+
+rtb:
+  # 竞价总超时预算（毫秒），M5 熔断以此为总闸
+  timeout-ms: 100
+  kafka:
+    topic: bid_event
+    partitions: 3
