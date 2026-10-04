@@ -1,8 +1,8 @@
 package com.rtb.ad;
 
+import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 
-import java.math.BigDecimal;
 import java.util.List;
 
 /**
@@ -11,6 +11,7 @@ import java.util.List;
  * <p>M1 阶段刻意保持朴素：SQL 里只有最基础的条件，不加任何提示性优化
  * （没有 hint、没有覆盖索引、没有强制索引），让 MySQL 自然走全表扫描。
  */
+@Mapper
 public interface AdMapper {
 
     /**

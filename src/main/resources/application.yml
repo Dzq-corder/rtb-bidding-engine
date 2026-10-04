@@ -1,4 +1,5 @@
 server:
+  # 8080。若被占用可临时改端口，演示手册里的 curl 命令也要同步改
   port: 8080
   tomcat:
     threads:

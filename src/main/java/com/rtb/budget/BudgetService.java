@@ -47,9 +47,10 @@ public class BudgetService {
     public BigDecimal getBalance(Long adId, BigDecimal dailyBudget) {
         String v = redis.opsForValue().get(key(adId));
         if (v == null) {
-            return initIfAbsent(adId, dailyBudget);
+            initIfAbsent(adId, dailyBudget);
+            v = redis.opsForValue().get(key(adId));
         }
-        return parse(v);
+        return parse(v == null ? String.valueOf(toCents(dailyBudget)) : v);
     }
 
     /**
@@ -67,7 +68,13 @@ public class BudgetService {
         // 第一步：读余额
         String cur = redis.opsForValue().get(k);
         if (cur == null) {
-            cur = initIfAbsent(adId, dailyBudget).toPlainString();
+            // 初始化后必须重新读，不能用 dailyBudget 的字符串代替：
+            // 存进 Redis 的是「分」，直接用「元」的字符串会差100 倍
+            initIfAbsent(adId, dailyBudget);
+            cur = redis.opsForValue().get(k);
+            if (cur == null) {
+                cur = String.valueOf(toCents(dailyBudget));
+            }
         }
 
         // 第二步：校验
@@ -85,13 +92,13 @@ public class BudgetService {
         return yuan.movePointRight(2).longValue();
     }
 
+    /** 分 -> 元 */
     private static BigDecimal parse(String cents) {
         return new BigDecimal(cents).movePointLeft(2);
     }
 
-    private BigDecimal initIfAbsent(Long adId, BigDecimal dailyBudget) {
+    private void initIfAbsent(Long adId, BigDecimal dailyBudget) {
         redis.opsForValue().setIfAbsent(key(adId), String.valueOf(toCents(dailyBudget)));
-        return dailyBudget;
     }
 
     /**

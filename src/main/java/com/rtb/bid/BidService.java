@@ -69,7 +69,8 @@ public class BidService {
         // ---------------------------------------------------------
         long tCand = System.nanoTime();
         List<Ad> candidates = adMapper.findActiveByCategory(req.getCategoryCode());
-        int candidateCost = elapsedMs(tCand, t0);
+        long tCandEnd = System.nanoTime();
+        int candidateCost = ms(tCand, tCandEnd);
 
         // ---------------------------------------------------------
         // ② 定向过滤
@@ -78,14 +79,16 @@ public class BidService {
         // 查它反而比不查更慢。定向匹配能力由 M2 的倒排求交提供。
         long tFilter = System.nanoTime();
         List<Ad> matched = new ArrayList<>(candidates);
-        int filterCost = elapsedMs(tFilter, t0);
+        long tFilterEnd = System.nanoTime();
+        int filterCost = ms(tFilter, tFilterEnd);
 
         // ---------------------------------------------------------
         // ③ 出价排序：应用层排序
         // ---------------------------------------------------------
         long tSort = System.nanoTime();
         matched.sort(Comparator.comparing(Ad::getBid).reversed());
-        int sortCost = elapsedMs(tSort, t0);
+        long tSortEnd = System.nanoTime();
+        int sortCost = ms(tSort, tSortEnd);
 
         // ---------------------------------------------------------
         // ④ 计费：一价，按最高出价扣
@@ -107,9 +110,10 @@ public class BidService {
                 adId = top.getId();
             }
         }
-        int billCost = elapsedMs(tBill, t0);
+        long tBillEnd = System.nanoTime();
+        int billCost = ms(tBill, tBillEnd);
 
-        int costMs = elapsedMs(t0, t0);
+        int costMs = ms(t0, tBillEnd);
 
         // ---------------------------------------------------------
         // ⑤ 落库：同步逐条 INSERT（M7 改批量）
@@ -189,6 +193,7 @@ public class BidService {
             Ad a = matched.get(i);
             BidRequest.AdInfo info = new BidRequest.AdInfo();
             info.setAdId(a.getId());
+            info.setAdvertiserId(a.getAdvertiserId());
             info.setTitle(a.getTitle());
             info.setCategoryCode(a.getCategoryCode());
             info.setBid(a.getBid());
@@ -207,7 +212,8 @@ public class BidService {
         return r;
     }
 
-    private static int elapsedMs(long fromNanos, long startNanos) {
-        return (int) ((fromNanos - startNanos) / 1_000_000);
+    /** 单段耗时（毫秒），向下取整 */
+    private static int ms(long fromNanos, long toNanos) {
+        return (int) ((toNanos - fromNanos) / 1_000_000);
     }
 }

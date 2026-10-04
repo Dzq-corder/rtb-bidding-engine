@@ -1,5 +1,6 @@
 package com.rtb.bid;
 
+import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 
 /**
@@ -16,6 +17,7 @@ import org.apache.ibatis.annotations.Param;
  *   <li>预聚合——大盘改查小时汇总表</li>
  * </ol>
  */
+@Mapper
 public interface BidLogMapper {
 
     /**
