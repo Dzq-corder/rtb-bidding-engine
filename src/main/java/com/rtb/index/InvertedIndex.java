@@ -48,6 +48,23 @@ public class InvertedIndex {
     public record TargetRow(Long id, Integer dimType, String dimValue, Long adId) {
     }
 
+    /**
+     * 每条广告的定向条件条数 · M5
+     *
+     * <p>加载索引时顺手统计，供兜底广告池排序用——
+     * <b>定向越宽泛的广告，越适合做熔断兜底</b>。
+     *
+     * <p>为什么放在内存算而不是 SQL 查：JOIN 596 万行 ad_target 做 GROUP BY
+     * 会超时（实测报 MySQLTimeoutException），而索引加载时本来就把每行读进来了，
+     * 顺手计数几乎零成本。
+     */
+    private final Map<Long, Integer> adTargetCount = new HashMap<>();
+
+    /** 某条广告的定向条件条数；不在索引里返回 0 */
+    public int targetCountOf(Long adId) {
+        return adTargetCount.getOrDefault(adId, 0);
+    }
+
     /** dim_type 常量，与 ad_target 对齐 */
     public static final int DIM_REGION = 1;
     public static final int DIM_AGE = 2;
@@ -150,6 +167,8 @@ public class InvertedIndex {
         for (TargetRow r : batch) {
             String key = r.dimType() + ":" + r.dimValue();
             pending.computeIfAbsent(key, k -> new HashSet<>()).add(r.adId().intValue());
+            // 顺手统计每广告的定向条数，供 M5 兜底池排序
+            adTargetCount.merge(r.adId(), 1, Integer::sum);
         }
         return batch.size();
     }
@@ -259,6 +278,16 @@ public class InvertedIndex {
      *
      * @param conditions 键为 "维度:取值"，值为广告 ID 数组
      * @return 按出价降序排的候选广告
+     *
+     * <p><b>返回的 List 一定可修改（mutable），包括空结果时。</b>
+     * 调用方 {@code BidService} 会对结果做 {@code removeIf}（按类目收窄）
+     * 和 {@code sort}，若这里返回 {@code List.of()} 这类不可变列表，
+     * 会抛 {@code UnsupportedOperationException}。
+     *
+     * <p><b>这个坑是 M5 压测时踩出来的</b>：空候选恰好是「返回不可变空列表」
+     * 这条分支，而它只在候选为 0 时触发，样本极少，
+     * 正常流程测不出来。压测 5000 次里碰到 4 次，全被异常兜底吃掉——
+     * <b>降级机制救了业务，但根因没修，填充率会平白掉一截</b>。
      */
     public List<Ad> intersect(List<String[]> conditions) {
         int[] result = null;
@@ -268,15 +297,15 @@ public class InvertedIndex {
             int dim = Integer.parseInt(c[0]);
             Map<String, int[]> dimMap = index.get(dim);
             if (dimMap == null) {
-                return List.of();
+                return new ArrayList<>(0);
             }
             int[] arr = dimMap.get(c[1]);
             if (arr == null || arr.length == 0) {
-                return List.of();
+                return new ArrayList<>(0);
             }
             result = (result == null) ? arr : gallop(result, arr);
             if (result.length == 0) {
-                return List.of();
+                return new ArrayList<>(0);
             }
         }
 

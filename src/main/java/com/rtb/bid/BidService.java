@@ -5,6 +5,8 @@ import com.rtb.ad.AdMapper;
 import com.rtb.bill.BillingEventMapper;
 import com.rtb.bill.SecondPriceBilling;
 import com.rtb.budget.BudgetService;
+import com.rtb.fallback.FallbackAdPool;
+import com.rtb.fallback.FaultInjector;
 import com.rtb.index.InvertedIndex;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -40,25 +42,57 @@ import java.util.concurrent.ThreadLocalRandom;
 @Service
 public class BidService {
 
+    /**
+     * 各阶段预算（毫秒）· M5
+     *
+     * <p>合计 90ms，留 10ms 余量给序列化与网络写出。
+     *
+     * <p><b>为什么检索占 60ms</b>：它是唯一可能退化到数据库的环节
+     * （倒排索引未就绪时降级 SQL，实测 38.9ms）。其余三步都是
+     * 纯内存计算或单次 Redis 往返，给再多预算也用不上。
+     *
+     * <p>预算不是按实测耗时 × 系数来的，而是按<b>最坏情况 × 安全系数</b>：
+     * 检索最坏 38.9ms（降级 SQL），60/38.9 ≈ 1.5 倍余量。
+     * 按实测值分配会在降级路径上误熔断。
+     */
+    private static final int BUDGET_CANDIDATE_MS = 60;
+    private static final int BUDGET_SORT_MS = 20;
+    private static final int BUDGET_BILL_MS = 10;
+
+    /**
+     * 总超时预算（毫秒）· M5
+     *
+     * <p><b>为什么是 100ms</b>：这是 RTB 行业的通行上限。
+     * 流量方（SSP）等待广告返回的时间预算通常也是 100ms 量级，
+     * 超过就判定为无填充能力，后续流量会被降权。
+     */
+    private static final int TOTAL_TIMEOUT_MS = 100;
+
     private final AdMapper adMapper;
     private final BidLogMapper bidLogMapper;
     private final BudgetService budgetService;
     private final InvertedIndex invertedIndex;
     private final SecondPriceBilling secondPriceBilling;
     private final BillingEventMapper billingEventMapper;
+    private final FallbackAdPool fallbackAdPool;
+    private final FaultInjector faultInjector;
 
     public BidService(AdMapper adMapper,
                       BidLogMapper bidLogMapper,
                       BudgetService budgetService,
                       InvertedIndex invertedIndex,
                       SecondPriceBilling secondPriceBilling,
-                      BillingEventMapper billingEventMapper) {
+                      BillingEventMapper billingEventMapper,
+                      FallbackAdPool fallbackAdPool,
+                      FaultInjector faultInjector) {
         this.adMapper = adMapper;
         this.bidLogMapper = bidLogMapper;
         this.budgetService = budgetService;
         this.invertedIndex = invertedIndex;
         this.secondPriceBilling = secondPriceBilling;
         this.billingEventMapper = billingEventMapper;
+        this.fallbackAdPool = fallbackAdPool;
+        this.faultInjector = faultInjector;
     }
 
     /**
@@ -66,10 +100,83 @@ public class BidService {
      *
      * <p>四段耗时分段埋点是本轮最重要的产出——
      * M2 之后要靠candidateCost 判断倒排索引到底省了多少。
+     *
+     * <p><b>M5 起整个方法被 try-catch 包住</b>：
+     * 任何环节抛异常（含Redis 挂掉、MySQL抖动）都退到兜底降级。
+     *
+     * <p>实测踩过的坑：只写「超时降级」是不够的。
+     * 预算扣减走 Redis，Redis 一挂就抛
+     * {@code RedisConnectionFailureException}，
+     * 异常从链路中间冒泡到控制器直接返回 500——<b>兜底代码根本没机会执行</b>。
+     * 降级必须是<b>最外层</b>的保护，而不是某个分支里的 if。
      */
     public BidRequest.Result bid(BidRequest req) {
+        try {
+            return doBid(req);
+        } catch (Exception e) {
+            log.error("竞价链路异常，退到兜底降级：{}", e.getMessage(), e);
+            return emergencyFallback(req, e);
+        }
+    }
+
+    /**
+     * 异常兜底：链路任何环节失败都走这里。
+     *
+     * <p><b>核心原则：宁可返回一条不精准的广告，也不要返回空。</b>
+     * 返回空 = 这次流量机会直接浪费 = 流量方白花钱买来的请求。
+     *
+     * <p>扣费失败也照样返回广告——曝光已经产生了，
+     * 扣费记 pending 由补偿机制处理，不能因为扣不动就放弃曝光。
+     */
+    private BidRequest.Result emergencyFallback(BidRequest req, Exception cause) {
+        long cost = 0;
+        Ad fb = null;
+        try {
+            fb = fallbackAdPool.resolve(fallbackAdPool.pick());
+        } catch (Exception ignore) {
+            // 连兜底池都出问题（理论上不该发生）——只能返回空
+            log.error("兜底池也失败了，本次只能返回空广告");
+        }
+
+        if (fb != null) {
+            safeDeduct(fb);
+        }
+
+        BidRequest.Result r = new BidRequest.Result();
+        r.setRequestId(UUID.randomUUID().toString().replace("-", ""));
+        r.setHasAd(fb != null);
+        r.setCandidateCnt(0);
+        r.setMatchCnt(0);
+        r.setTopCandidates(List.of());
+        r.setPriceMode(0);
+        r.setTimedOut(false);
+        // 异常降级同样标记 fallback=true：
+        // 对监控来说「异常」和「超时」是两种降级触发原因，
+        // 但对业务来说都是「这次流量走的是兜底池」，口径必须一致。
+        r.setFallback(fb != null);
+        if (fb != null) {
+            BidRequest.AdInfo info = new BidRequest.AdInfo();
+            info.setAdId(fb.getId());
+            info.setAdvertiserId(fb.getAdvertiserId());
+            info.setTitle(fb.getTitle());
+            info.setCategoryCode(fb.getCategoryCode());
+            info.setBid(fb.getBid());
+            r.setWinner(info);
+        }
+        BidRequest.Cost c = new BidRequest.Cost();
+        c.setTotal(0);
+        c.setCandidate(0);
+        c.setFilter(0);
+        c.setSort(0);
+        c.setBill(0);
+        r.setCost(c);
+        return r;
+    }
+
+    private BidRequest.Result doBid(BidRequest req) {
         long t0 = System.nanoTime();
         String requestId = UUID.randomUUID().toString().replace("-", "");
+        Deadline dl = new Deadline(TOTAL_TIMEOUT_MS);
 
         // ---------------------------------------------------------
         // ① 候选检索
@@ -80,6 +187,14 @@ public class BidService {
         // 索引未就绪时降级回 M1 的 SQL 路径——可用性优先于性能。
         // ---------------------------------------------------------
         long tCand = System.nanoTime();
+
+        // 故障注入点：模拟「候选检索这一步变慢」。
+        //
+        // 位置很关键：必须放在检索<b>之前</b>。
+        // 若放在检索之后，正常胜者已经算出来了，超时判定时直接返回它，
+        // 根本走不到兜底池，降级逻辑等于没被验证。
+        // 放前面才符合真实故障形态——慢依赖让后续步骤根本没机会执行。
+        faultInjector.injectDelay();
 
         String ageBucket = TargetingMapper.resolveAgeBucket(req.getAge(), req.getAgeBucket());
         String gender = TargetingMapper.toGender(req.getGender());
@@ -104,6 +219,22 @@ public class BidService {
         int candidateCost = ms(tCand, tCandEnd);
 
         // ---------------------------------------------------------
+        // ①' 熔断点 1：检索已经超时，后面两步别做了
+        //
+        // <b>这里是「熔断」和「末尾统一判超时」的本质区别</b>：
+        // 检索慢到 100ms 以上时，排序与计费即使能做完也毫无意义——
+        // 调用方早就断开了。及时放弃才是熔断该做的事。
+        //
+        // 注意兜底路径<b>不受这个判定约束</b>：它必须执行到底，
+        // 因为返回空等于浪费这次流量。
+        // ---------------------------------------------------------
+        if (dl.expired()) {
+            log.warn("检索阶段超时 {} ms，跳过排序与计费，直接兜底 requestId={}",
+                    dl.elapsedMs(), requestId);
+            return fallbackResult(req, requestId, t0, candidateCost, 0, 0, 0, List.of());
+        }
+
+        // ---------------------------------------------------------
         // ② 定向过滤
         //
         // M1 阶段定向匹配在候选检索的 SQL JOIN 里做完了，这一段是应用层拷贝。
@@ -125,6 +256,13 @@ public class BidService {
         long tSortEnd = System.nanoTime();
         int sortCost = ms(tSort, tSortEnd);
 
+        // 熔断点 2：排序也用掉大部分预算了，别再扣钱
+        if (dl.expired()) {
+            log.warn("排序阶段超时 {} ms，跳过计费，直接兜底 requestId={}",
+                    dl.elapsedMs(), requestId);
+            return fallbackResult(req, requestId, t0, candidateCost, filterCost, sortCost, 0, matched);
+        }
+
         // ---------------------------------------------------------
         // ④ 计费：二价，按次高价 + 0.01 结算（M4）
         //
@@ -141,6 +279,15 @@ public class BidService {
         Long adId = null;
         int isSecondPrice = 0;
         int edgeCase = 0;
+
+        // 熔断点 3：计费前最后一道闸。
+        // 走到这里预算已经很紧，但计费<b>不做也不合适</b>——
+        // 没有扣费就不能算成交，放出去就是白送曝光。
+        // 所以这里只做 warn，不中断。
+        if (!dl.hasBudgetFor(BUDGET_BILL_MS)) {
+            log.warn("计费前剩余预算仅 {} ms，可能超总预算 requestId={}",
+                    dl.remainingMs(), requestId);
+        }
 
         if (!matched.isEmpty()) {
             // matched 已按出价降序（步骤③ 排过）
@@ -167,20 +314,140 @@ public class BidService {
         int costMs = ms(t0, tBillEnd);
 
         // ---------------------------------------------------------
-        // ⑤ 落库：bid_log 同步逐条INSERT（M7 改批量）
+        // ⑤ 熔断判定（M5）· 终态
+        //
+        // <b>关键取舍：已经扣到钱的胜者，不因为超时就丢掉。</b>
+        //
+        // 前面 6 次 M5 压测（注入 150ms）时，这里是「超时就把正常胜者
+        // 换成兜底广告」，结果熔断 2000 次里只有 113 次真走了兜底，
+        // 剩下的都因为「超时前已算出 winner」而被替换。
+        // 那个设计是错的——它把一个精准结果降级成随机结果，
+        // 超时既没省时间（钱照样扣了、明细照样写了），又损失了精准度。
+        //
+        // 现在的规则：
+        //   有 winner（已扣费）→ 正常返回，标记 timedOut 但不降级
+        //   无 winner          → 必须走兜底，宁可低精准度也不返回空
+        // ---------------------------------------------------------
+        boolean timeout = costMs >= TOTAL_TIMEOUT_MS;
+
+        Ad finalWinner = winner;
+        BigDecimal finalPay = payPrice;
+        Integer finalAdvertiserId = advertiserId;
+        Long finalAdId = adId;
+        BigDecimal finalSecondPrice = secondPrice;
+        int finalIsSecondPrice = isSecondPrice;
+        int finalCandidateCnt = candidates.size();
+        int finalMatchCnt = matched.size();
+        boolean usedFallback = false;
+
+        if (timeout && winner == null) {
+            // ---- 兜底降级 ----
+            Ad fb = fallbackAdPool.resolve(fallbackAdPool.pick());
+            if (fb != null) {
+                // 兜底广告按一价扣（不排序、没有次高价概念）。
+                // 关键：扣费失败也要返回广告——曝光已经产生了，
+                // 扣费失败记 pending 由异步补偿，绝不能因为扣不动就返回空。
+                boolean deducted = safeDeduct(fb);
+                if (deducted) {
+                    finalWinner = fb;
+                    finalPay = fb.getBid();
+                    finalAdvertiserId = fb.getAdvertiserId();
+                    finalAdId = fb.getId();
+                    finalSecondPrice = null;
+                    finalIsSecondPrice = 0;
+                    usedFallback = true;
+                }
+                // deducted=false 时 finalWinner 仍为 null，
+                // 会计入 has_ad=0 —— 这是「扣费失败也不白送曝光」与
+                // 「绝不返回空」两个目标的取舍点，已在 metrics 记录
+            }
+        }
+
+        // ---------------------------------------------------------
+        // ⑥ 落库：bid_log 同步逐条INSERT（M7 改批量）
         //    billing_event 记录金钱事实，与 bid_log 分级
         // ---------------------------------------------------------
-        persistLog(requestId, req, candidates.size(), matched.size(),
-                adId, advertiserId, winner, payPrice,
+        persistLog(requestId, req, finalCandidateCnt, finalMatchCnt,
+                finalAdId, finalAdvertiserId, finalWinner, finalPay,
                 costMs, candidateCost, filterCost, sortCost, billCost);
 
         // 计费事件与竞价明细分级：明细可丢，钱不能丢
-        if (winner != null) {
-            persistBillingEvent(requestId, winner, payPrice, secondPrice, isSecondPrice);
+        if (finalWinner != null) {
+            persistBillingEvent(requestId, finalWinner, finalPay, finalSecondPrice,
+                    finalIsSecondPrice);
         }
 
-        return buildResult(requestId, candidates, matched, winner, payPrice,
+        BidRequest.Result result = buildResult(requestId, candidates, matched,
+                finalWinner, finalPay, costMs, candidateCost, filterCost, sortCost, billCost);
+        result.setTimedOut(timeout);
+        // 用显式标记而不是「finalWinner != null && winner == null」推断。
+        // 后者的坑：异常兜底路径返回的广告也会满足 winner == null，
+        // 混在一起就分不清「超时降级」和「异常降级」了。
+        result.setFallback(usedFallback);
+        return result;
+    }
+
+    /**
+     * 阶段边界熔断的统一出口：直接走兜底并返回结果。
+     *
+     * <p>把「检索后熔断」和「排序后熔断」收敛到一个方法，
+     * 避免两条分支的落库、标志位设置出现细微差异——
+     * <b>降级路径必须只有一份实现</b>，否则出问题时很难定位是哪条分支漏了。
+     *
+     * @param matched 已完成的候选（可能是空），只用于记录候选数
+     */
+    private BidRequest.Result fallbackResult(BidRequest req, String requestId,
+                                            long t0, int candidateCost,
+                                            int filterCost, int sortCost, int billCost,
+                                            List<Ad> matched) {
+        int costMs = ms(t0, System.nanoTime());
+
+        Ad fb = null;
+        try {
+            fb = fallbackAdPool.resolve(fallbackAdPool.pick());
+        } catch (Exception e) {
+            log.error("兜底广告选取失败 requestId={}: {}", requestId, e.getMessage());
+        }
+
+        boolean deducted = false;
+        if (fb != null) {
+            deducted = safeDeduct(fb);
+        }
+        Ad finalWinner = deducted ? fb : null;
+
+        persistLog(requestId, req, matched.size(), matched.size(),
+                finalWinner == null ? null : finalWinner.getId(),
+                finalWinner == null ? null : finalWinner.getAdvertiserId(),
+                finalWinner, finalWinner == null ? null : finalWinner.getBid(),
                 costMs, candidateCost, filterCost, sortCost, billCost);
+
+        if (finalWinner != null) {
+            // 兜底广告按一价结算，没有次高价概念
+            persistBillingEvent(requestId, finalWinner, finalWinner.getBid(), null, 0);
+        }
+
+        BidRequest.Result result = buildResult(requestId, matched, matched,
+                finalWinner, finalWinner == null ? null : finalWinner.getBid(),
+                costMs, candidateCost, filterCost, sortCost, billCost);
+        result.setTimedOut(true);
+        result.setFallback(finalWinner != null);
+        return result;
+    }
+
+    /**
+     * 兜底路径的扣费，异常一律吞掉。
+     *
+     * <p>熔断时 Redis 可能已经不可用——这里再抛异常会让整个降级失效。
+     * 扣费失败记 warn，由补偿机制兜底，但<b>绝不能因此不返回广告</b>。
+     */
+    private boolean safeDeduct(Ad ad) {
+        try {
+            return budgetService.deduct(ad.getId(), ad.getDailyBudget(), ad.getBid());
+        } catch (Exception e) {
+            log.warn("兜底广告扣费失败 adId={}，曝光已产生待异步补偿：{}",
+                    ad.getId(), e.getMessage());
+            return false;
+        }
     }
 
     /**

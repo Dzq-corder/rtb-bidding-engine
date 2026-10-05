@@ -168,16 +168,39 @@ public class BidController {
                 new java.util.concurrent.atomic.AtomicInteger();
         java.util.concurrent.atomic.AtomicInteger hasAdCounter =
                 new java.util.concurrent.atomic.AtomicInteger();
+        // M5：熔断触发次数与兜底返回次数。
+        // 只有这两个计数才能算出「熔断触发率」和「熔断时的广告保住率」，
+        // 而这两项正是 M5 的验收指标，光看填充率看不出降级是否真的生效。
+        java.util.concurrent.atomic.AtomicInteger timeoutCounter =
+                new java.util.concurrent.atomic.AtomicInteger();
+        // 熔断后仍然返回了广告的次数。
+        // 口径说明：熔断不代表一定走兜底池——如果慢点在计费之后，
+        // 正常胜者已经算出来了，直接返回它比换成兜底广告更好（精准度更高）。
+        // 所以「熔断时有没有保住这次流量」才是要统计的东西，
+        // 而不是「有多少次走了兜底池」。
+        java.util.concurrent.atomic.AtomicInteger timeoutHasAdCounter =
+                new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicInteger fallbackCounter =
+                new java.util.concurrent.atomic.AtomicInteger();
 
         long start = System.nanoTime();
         if (c == 1) {
             // 串行路径：无额外线程开销，延迟分布最纯净
             for (int i = 0; i < n; i++) {
                 long t = System.nanoTime();
-                boolean hit = Boolean.TRUE.equals(bidService.bid(randomRequest()).getHasAd());
+                BidRequest.Result res = bidService.bid(randomRequest());
                 latencies[i] = (int) ((System.nanoTime() - t) / 1_000_000);
-                if (hit) {
+                if (Boolean.TRUE.equals(res.getHasAd())) {
                     hasAdCounter.incrementAndGet();
+                }
+                if (Boolean.TRUE.equals(res.getTimedOut())) {
+                    timeoutCounter.incrementAndGet();
+                    if (Boolean.TRUE.equals(res.getHasAd())) {
+                        timeoutHasAdCounter.incrementAndGet();
+                    }
+                }
+                if (Boolean.TRUE.equals(res.getFallback())) {
+                    fallbackCounter.incrementAndGet();
                 }
             }
         } else {
@@ -189,10 +212,19 @@ public class BidController {
                     int i;
                     while ((i = cursor.getAndIncrement()) < n) {
                         long t = System.nanoTime();
-                        boolean hit = Boolean.TRUE.equals(bidService.bid(randomRequest()).getHasAd());
+                        BidRequest.Result res = bidService.bid(randomRequest());
                         latencies[i] = (int) ((System.nanoTime() - t) / 1_000_000);
-                        if (hit) {
+                        if (Boolean.TRUE.equals(res.getHasAd())) {
                             hasAdCounter.incrementAndGet();
+                        }
+                        if (Boolean.TRUE.equals(res.getTimedOut())) {
+                            timeoutCounter.incrementAndGet();
+                            if (Boolean.TRUE.equals(res.getHasAd())) {
+                                timeoutHasAdCounter.incrementAndGet();
+                            }
+                        }
+                        if (Boolean.TRUE.equals(res.getFallback())) {
+                            fallbackCounter.incrementAndGet();
                         }
                     }
                 }));
@@ -209,6 +241,9 @@ public class BidController {
         long elapsed = System.nanoTime() - start;
 
         int hasAd = hasAdCounter.get();
+        int timeouts = timeoutCounter.get();
+        int timeoutHasAd = timeoutHasAdCounter.get();
+        int fallbacks = fallbackCounter.get();
         double qps = n / (elapsed / 1_000_000_000.0);
         double emptyRate = n == 0 ? 0 : (n - hasAd) * 100.0 / n;
 
@@ -221,6 +256,15 @@ public class BidController {
         resp.put("qps", round(qps));
         resp.put("fillRate", round(100 - emptyRate));
         resp.put("emptyRate", round(emptyRate));
+        // M5 降级观测
+        resp.put("timeoutCnt", timeouts);
+        resp.put("timeoutRate", round(n == 0 ? 0 : timeouts * 100.0 / n));
+        // 熔断后仍返回广告的比例 —— M5 最核心的数字。
+        // 100% 意味着：慢到熔断的请求，一次流量机会都没浪费。
+        resp.put("timeoutHasAd", timeoutHasAd);
+        resp.put("timeoutKeepRate", round(timeouts == 0 ? 100.0 : timeoutHasAd * 100.0 / timeouts));
+        // 实际走兜底池的次数（熔断但正常胜者已算出时不会走）
+        resp.put("fallbackCnt", fallbacks);
         resp.put("elapsedMs", elapsed / 1_000_000);
         resp.put("p50", percentile(latencies, 50));
         resp.put("p95", percentile(latencies, 95));

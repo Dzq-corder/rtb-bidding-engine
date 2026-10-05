@@ -54,6 +54,23 @@ public class BidRequest {
         /** 计费方式：0 一价 1 二价 */
         private Integer priceMode;
         private Cost cost;
+
+        /**
+         * 本次竞价是否超时（超过 100ms 预算）· M5
+         *
+         * <p>用于压测与监控：超时率上升说明系统已过载，
+         * 该考虑扩容或继续优化，而不是盲目加机器。
+         */
+        private Boolean timedOut;
+
+        /**
+         * 返回的是否是兜底广告 · M5
+         *
+         * <p>true 表示主链路超时或异常，降级返回了预置广告。
+         * 兜底率是比空广告率更严格的可用性指标——
+         * 它说明「连降级路径都走过了」，说明系统真的扛不住了。
+         */
+        private Boolean fallback;
     }
 
     @Data

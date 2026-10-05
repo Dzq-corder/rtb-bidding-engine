@@ -100,3 +100,11 @@ rtb:
   kafka:
     topic: bid_event
     partitions: 3
+  fallback:
+    # 熔断故障注入开关 · M5
+    # 生产必须为 false。打开后 /fallback/inject?delayMs=150 可主动
+    # 拖慢链路以演练超时降级；用于预发环境验证降级能力。
+    # 为什么需要它：M2~M4 优化后单次竞价只要 2~7ms，
+    # 而预算是 100ms —— 不主动注入，熔断路径在压测里一次都走不到，
+    # 「空广告率 A→B」里的 B 就没有样本。
+    inject-enabled: true

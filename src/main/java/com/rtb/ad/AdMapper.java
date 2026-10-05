@@ -79,4 +79,22 @@ public interface AdMapper {
      */
     List<com.rtb.index.InvertedIndex.TargetRow> selectTargetingBatch(@Param("lastId") long lastId,
                                                                     @Param("limit") int limit);
+
+    /**
+     * 查兜底广告候选池（M5 熔断降级用）。
+     *
+     * <p>筛选条件的设计意图见 {@code FallbackAdPool} 的类注释，
+     * 简单说：<b>预算充足 + 定向宽泛 + 出价低</b>。
+     *
+     * <p>出价低是硬要求：熔断往往发生在系统高负载时，
+     * 此时扣高价广告的钱等于在最不该扣的时候扣最多的钱。
+     *
+     * <p>按定向条件数升序：定向越宽泛，越容易在紧急时刻被选中兜底。
+     */
+    List<Ad> findFallbackAds(@Param("limit") int limit);
+
+    /**
+     * 按主键查单条广告，用于兜底时取详情。
+     */
+    Ad findById(@Param("id") Long id);
 }

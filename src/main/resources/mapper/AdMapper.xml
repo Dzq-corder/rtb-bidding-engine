@@ -95,4 +95,37 @@
     LIMIT #{limit}
   </select>
 
+  <!--
+    兜底广告候选池（M5 熔断降级用）
+
+    三个筛选条件对应 FallbackAdPool 的设计意图：
+      1. status=1        在投
+      2. bid <= 3        出价低——熔断时扣高价等于在高负载时扣大额预算
+      3. daily_budget >= 10000  预算充足，不会扣成负数
+
+    ⚠️ 刻意不在 SQL 里排序：
+    `ORDER BY (SELECT COUNT(*) FROM ad_target WHERE ad_id=a.id)` 与
+    `LEFT JOIN ad_target GROUP BY ORDER BY COUNT(t.id)`
+    两种写法在 596 万行的 ad_target 上都直接超时
+    （实测 MySQLTimeoutException）。
+    改成查一批候选后在内存里按定向条数排序——
+    M2 的倒排索引加载时已统计好条数，读内存零成本。
+  -->
+  <select id="findFallbackAds" resultType="com.rtb.ad.Ad">
+    SELECT id, advertiser_id, title, creative_url, category_code,
+           bid, daily_budget, status, created_at, updated_at
+    FROM ad
+    WHERE status = 1
+      AND bid &lt;= 3.00
+      AND daily_budget &gt;= 10000
+    LIMIT #{limit}
+  </select>
+
+  <select id="findById" resultType="com.rtb.ad.Ad">
+    SELECT id, advertiser_id, title, creative_url, category_code,
+           bid, daily_budget, status, created_at, updated_at
+    FROM ad
+    WHERE id = #{id}
+  </select>
+
 </mapper>
