@@ -1,24 +1,41 @@
 package com.rtb.budget;
 
+import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
+import java.util.List;
 
 /**
- * 预算服务 · M1 朴素实现
+ * 预算服务 · M3 原子扣减
  *
- * <p><b>本轮刻意不做原子性封装</b>：余额校验和扣减是两条独立命令、
- * 两次往返。M3 才把它们合并进一个 Lua 脚本。
+ * <p><b>M1 版本的缺陷（本类已修掉）</b>
  *
- * <p><b>为什么这不是「故意写丑」</b>：校验 + 扣减分两步是最直观、最容易
- * 想到的写法，它是「正确的实现，尚未加固」。真正的并发超扣问题要等到
- * 有实际并发压测时才会暴露，M3 的 Lua 脚本是对那个问题的直接回应。
- * 面试时的表述是：「初版用两步做，压测发现会超扣，改成 Lua 原子操作」——
- * 这比一开始就写 Lua 更可信，因为前者说明你真的遇到过那个问题。
+ * <p>M1 的扣减是「读余额 → 校验 → 扣减」三条独立命令、两次往返。
+ * 并发下的错位场景：
+ * <pre>
+ *   请求 A、B 同时读到余额 10 元
+ *   两个都通过校验（10 ≥ 8）
+ *   各自扣 8 元
+ *   结果余额变成 -6 元 —— 超扣
+ * </pre>
+ *
+ * <p>这个问题的暴露过程值得讲：M1 的压测填充率正常，因为单线程串行跑时
+ * 三步之间没有插队的窗口。**必须上并发才会复现**。
+ *
+ * <p><b>M3 的解法</b>：把三步收进一个 Lua 脚本。
+ * Redis 执行 Lua 期间不会处理其他命令，因此不存在中间态。
+ *
+ * <p><b>顺带的性能收益</b>：网络往返从 2 次降到 1 次。
+ * M2 之后计费占了 76% 的耗时（两次Redis 往返的固定成本），
+ * 所以这一轮既是正确性修复也是延迟优化。
  *
  * <p>Key 命名：{@code budget:{adId}:{yyyyMMdd}}，按天分桶让过期策略自然生效。
  */
@@ -28,10 +45,36 @@ public class BudgetService {
 
     private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("yyyyMMdd");
 
+    /** 余额不足的返回码，与 Lua 脚本约定一致 */
+    private static final long NOT_ENOUGH = -1L;
+    private static final long INIT_FAILED = -2L;
+
     private final StringRedisTemplate redis;
+    private final RedisScript<Long> deductScript;
 
     public BudgetService(StringRedisTemplate redis) {
         this.redis = redis;
+        this.deductScript = buildScript();
+    }
+
+    @PostConstruct
+    private void warmScript() {
+        // 提前加载脚本并算好 SHA1。Redis 的 EVALSHA 会用这个 SHA 去缓存里找脚本，
+        // 首次执行时若本地没有才回源加载。预热可避免首个请求多一次往返。
+        try {
+            redis.execute(deductScript, List.of("warmup:key"), "0", "0");
+            log.info("预算扣减 Lua 脚本已预热");
+        } catch (Exception e) {
+            log.warn("预算扣减 Lua 脚本预热失败，将在首次调用时加载：{}", e.getMessage());
+        }
+    }
+
+    @SuppressWarnings("rawtypes")
+    private RedisScript<Long> buildScript() {
+        DefaultRedisScript<Long> script = new DefaultRedisScript<>();
+        script.setLocation(new ClassPathResource("lua/deduct_budget.lua"));
+        script.setResultType(Long.class);
+        return script;
     }
 
     private String key(Long adId) {
@@ -42,7 +85,7 @@ public class BudgetService {
      * 查询当前余额，不存在则按广告日预算初始化。
      *
      * <p>惰性初始化：Redis 里没有就查 MySQL 拿日预算写进去。
-     * M3 起这里会配合批量预热，避免竞价链路上出现初始化写。
+     * M2 之后这一步仍在竞价链路上，属于可优化项。
      */
     public BigDecimal getBalance(Long adId, BigDecimal dailyBudget) {
         String v = redis.opsForValue().get(key(adId));
@@ -54,37 +97,48 @@ public class BudgetService {
     }
 
     /**
-     * 扣减预算。M1 版本：三步操作，非原子。
+     * 扣减预算 —— 原子操作。
      *
-     * <p>并发下的错位场景：请求 A、B 同时读到余额 10 元，都通过校验，
-     * 各自扣 8 元，结果余额变成 -6 元，超扣发生。
-     * M3 用 Lua 把三步收进一个原子操作，消除这个窗口。
+     * <p>「校验余额够不够」和「扣减」必须原子完成，
+     * 否则并发下会超扣。见类注释里的错位场景。
      *
      * @return true 扣减成功；false 余额不足
      */
     public boolean deduct(Long adId, BigDecimal dailyBudget, BigDecimal amount) {
         String k = key(adId);
+        Long remain = redis.execute(deductScript,
+                List.of(k),
+                String.valueOf(toCents(amount)),
+                String.valueOf(toCents(dailyBudget)));
 
-        // 第一步：读余额
-        String cur = redis.opsForValue().get(k);
-        if (cur == null) {
-            // 初始化后必须重新读，不能用 dailyBudget 的字符串代替：
-            // 存进 Redis 的是「分」，直接用「元」的字符串会差100 倍
-            initIfAbsent(adId, dailyBudget);
-            cur = redis.opsForValue().get(k);
-            if (cur == null) {
-                cur = String.valueOf(toCents(dailyBudget));
-            }
-        }
-
-        // 第二步：校验
-        if (parse(cur).compareTo(amount) < 0) {
+        if (remain == null) {
+            // 脚本执行异常，按扣减失败处理。
+            // 宁可少扣一次让广告主重投，也不能在不确定状态下返回成功。
+            log.error("预算扣减脚本返回空，adId={} amount={}", adId, amount);
             return false;
         }
-
-        // 第三步：扣减
-        redis.opsForValue().decrement(k, toCents(amount));
+        if (remain == NOT_ENOUGH) {
+            return false;
+        }
+        if (remain == INIT_FAILED) {
+            log.error("预算初始化失败，adId={}", adId);
+            return false;
+        }
         return true;
+    }
+
+    /**
+     * 扣减并返回扣减后的余额，供演示与对账使用。
+     *
+     * @return 扣减后的余额（分）；余额不足返回 {@link #NOT_ENOUGH}
+     */
+    public long deductAndGetRemain(Long adId, BigDecimal dailyBudget, BigDecimal amount) {
+        String k = key(adId);
+        Long remain = redis.execute(deductScript,
+                List.of(k),
+                String.valueOf(toCents(amount)),
+                String.valueOf(toCents(dailyBudget)));
+        return remain == null ? INIT_FAILED : remain;
     }
 
     /** 金额统一以「分」为单位存进 Redis，避免 double 的浮点误差 */
@@ -101,9 +155,7 @@ public class BudgetService {
         redis.opsForValue().setIfAbsent(key(adId), String.valueOf(toCents(dailyBudget)));
     }
 
-    /**
-     * 预算是否耗尽，用于日志与调试。
-     */
+    /** 预算是否耗尽，用于日志与调试。 */
     public boolean isExhausted(Long adId, BigDecimal dailyBudget) {
         return getBalance(adId, dailyBudget).signum() <= 0;
     }
