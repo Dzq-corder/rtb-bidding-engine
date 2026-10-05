@@ -2,6 +2,8 @@ package com.rtb.bid;
 
 import com.rtb.ad.Ad;
 import com.rtb.ad.AdMapper;
+import com.rtb.bill.BillingEventMapper;
+import com.rtb.bill.SecondPriceBilling;
 import com.rtb.budget.BudgetService;
 import com.rtb.index.InvertedIndex;
 import lombok.extern.slf4j.Slf4j;
@@ -42,15 +44,21 @@ public class BidService {
     private final BidLogMapper bidLogMapper;
     private final BudgetService budgetService;
     private final InvertedIndex invertedIndex;
+    private final SecondPriceBilling secondPriceBilling;
+    private final BillingEventMapper billingEventMapper;
 
     public BidService(AdMapper adMapper,
                       BidLogMapper bidLogMapper,
                       BudgetService budgetService,
-                      InvertedIndex invertedIndex) {
+                      InvertedIndex invertedIndex,
+                      SecondPriceBilling secondPriceBilling,
+                      BillingEventMapper billingEventMapper) {
         this.adMapper = adMapper;
         this.bidLogMapper = bidLogMapper;
         this.budgetService = budgetService;
         this.invertedIndex = invertedIndex;
+        this.secondPriceBilling = secondPriceBilling;
+        this.billingEventMapper = billingEventMapper;
     }
 
     /**
@@ -118,23 +126,39 @@ public class BidService {
         int sortCost = ms(tSort, tSortEnd);
 
         // ---------------------------------------------------------
-        // ④ 计费：一价，按最高出价扣
+        // ④ 计费：二价，按次高价 + 0.01 结算（M4）
+        //
+        // M1~M3 是一价（按最高出价扣），M4 起改为二价。
+        // 边界情形由 SecondPriceBilling 统一处理：
+        //   · 候选只有 1 条  → 按该条出价的 60% 结算
+        //   · 次高价 + 0.01 超过胜出者出价 → 按胜出者出价结算
         // ---------------------------------------------------------
         long tBill = System.nanoTime();
         Ad winner = null;
         BigDecimal payPrice = null;
+        BigDecimal secondPrice = null;
         Integer advertiserId = null;
         Long adId = null;
+        int isSecondPrice = 0;
+        int edgeCase = 0;
 
         if (!matched.isEmpty()) {
-            Ad top = matched.get(0);
-            // 一价：出多少扣多少
-            boolean deducted = budgetService.deduct(top.getId(), top.getDailyBudget(), top.getBid());
-            if (deducted) {
-                winner = top;
-                payPrice = top.getBid();
-                advertiserId = top.getAdvertiserId();
-                adId = top.getId();
+            // matched 已按出价降序（步骤③ 排过）
+            SecondPriceBilling.BillingResult r = secondPriceBilling.settle(matched);
+            if (r.success()) {
+                Ad top = r.winner();
+                // 扣的是实际应收（次高价+0.01），不是赢家自己的出价。
+                // 这样广告主「报真实意愿价」才是最优策略。
+                boolean deducted = budgetService.deduct(top.getId(), top.getDailyBudget(), r.payPrice());
+                if (deducted) {
+                    winner = top;
+                    payPrice = r.payPrice();
+                    secondPrice = r.secondPrice();
+                    advertiserId = top.getAdvertiserId();
+                    adId = top.getId();
+                    isSecondPrice = r.hasSecondPrice() ? 1 : 0;
+                    edgeCase = r.edgeCase();
+                }
             }
         }
         long tBillEnd = System.nanoTime();
@@ -143,14 +167,53 @@ public class BidService {
         int costMs = ms(t0, tBillEnd);
 
         // ---------------------------------------------------------
-        // ⑤ 落库：同步逐条 INSERT（M7 改批量）
+        // ⑤ 落库：bid_log 同步逐条INSERT（M7 改批量）
+        //    billing_event 记录金钱事实，与 bid_log 分级
         // ---------------------------------------------------------
         persistLog(requestId, req, candidates.size(), matched.size(),
                 adId, advertiserId, winner, payPrice,
                 costMs, candidateCost, filterCost, sortCost, billCost);
 
+        // 计费事件与竞价明细分级：明细可丢，钱不能丢
+        if (winner != null) {
+            persistBillingEvent(requestId, winner, payPrice, secondPrice, isSecondPrice);
+        }
+
         return buildResult(requestId, candidates, matched, winner, payPrice,
                 costMs, candidateCost, filterCost, sortCost, billCost);
+    }
+
+    /**
+     * 写计费事件 —— 金钱事实，不可丢。
+     *
+     * <p><b>为什么与 bid_log 分开两张表</b>：分界线是「丢了这笔数据有没有业务后果」。
+     * bid_log 是大盘明细，丢几条不影响「上周哪天最忙」这个结论；
+     * billing_event 是扣费事实，丢一条就少收一笔钱，是资损。
+     *
+     * <p><b>M6 接 Kafka 后的幂等</b>：event_id 走唯一键，
+     * Kafka 重投时撞唯一键被识别丢弃，保证最终只生效一次。
+     * M4 阶段是同步写入，还没有重投，但唯一键先建好，行为一致。
+     */
+    private void persistBillingEvent(String requestId, Ad winner,
+                                     BigDecimal payPrice, BigDecimal secondPrice,
+                                     int isSecondPrice) {
+        try {
+            billingEventMapper.insert(
+                    UUID.randomUUID().toString().replace("-", ""),
+                    requestId,
+                    winner.getId(),
+                    winner.getAdvertiserId(),
+                    winner.getBid(),
+                    payPrice,
+                    secondPrice,
+                    isSecondPrice,
+                    LocalDateTime.now());
+        } catch (Exception e) {
+            // 钱的事实不能丢，但要保证竞价链路本身不崩。
+            // 这里只告警：真实系统里应由 M6 的 Kafka 消费端重试兜底。
+            log.error("写入计费事件失败 requestId={} adId={} pay={}",
+                    requestId, winner.getId(), payPrice, e);
+        }
     }
 
     /**

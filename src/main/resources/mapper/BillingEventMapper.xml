@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.rtb.bill.BillingEventMapper">
+
+  <!--
+    写入计费事件。
+    event_id 唯一键冲突时抛DuplicateKey，由上层捕获后丢弃——
+    这就是消费端幂等的物理保障（M6 接 Kafka 后重投会撞这里）。
+  -->
+  <insert id="insert">
+    INSERT INTO billing_event
+      (event_id, request_id, ad_id, advertiser_id,
+       bid_price, pay_price, second_price, is_second_price, billed_at)
+    VALUES
+      (#{eventId}, #{requestId}, #{adId}, #{advertiserId},
+       #{bidPrice}, #{payPrice}, #{secondPrice}, #{isSecondPrice}, #{billedAt})
+  </insert>
+
+</mapper>
