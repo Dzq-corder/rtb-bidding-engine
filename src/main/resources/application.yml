@@ -48,18 +48,50 @@ spring:
       acks: all
       retries: 3
       properties:
-        enable.idempotence: true
-        linger.ms: 5
+        # 【为什么 batch.size 给到 32KB】默认 16KB。
+        # 竞价事件高频小消息，攒大一点能显著降低每条的网络开销。
+        # 代价是单条消息的发送延迟略增——
+        # 但因为本项目不阻塞等待发送结果（见 EventProducer），
+        # 这点延迟对同步链路完全无感。
         batch.size: 32768
+        # 【为什么开幂等生产者】Kafka 自身保证「同分区内不重复」，
+        # 与 M6 消费端的唯一键幂等是两层独立保障。
+        # 幂等生产者解决「生产侧重试导致的重复」，
+        # 唯一键解决「消费侧重投导致的重复」——两者不能互相替代。
+        enable.idempotence: true
+        # 单个分区内 producer 的最大在途请求数
+        max.in.flight.requests.per.connection: 5
+        # 【为什么给 60 秒】Broker 假死时，producer 默认只等 30 秒就放弃。
+        # 60 秒配合「不阻塞等待」的调用方式，
+        # 让消息在缓冲里多留一会儿，提高投递成功率。
+        delivery.timeout.ms: 60000
+        request.timeout.ms: 15000
+        # 【为什么 compression 不开】本项目是本地演示，
+        # 压缩省不了多少 CPU 但增加排查时的复杂度（要看解压后的内容）。
+        # 真实系统里高吞吐场景会用 lz4。
+        compression.type: none
     consumer:
       group-id: rtb-engine
-      auto-offset-reset: latest
+      # 【为什么用 earliest 而不是 latest】
+      # latest = 启动后才收到的消息才消费，之前的全部跳过。
+      # 演示时重启服务会「丢掉」刚才压测产生的事件，
+      # 让人误以为事件丢了。earliest 保证不丢。
+      auto-offset-reset: earliest
       enable-auto-commit: false
       # 消费端手动提交位点，保证至少一次投递
       max-poll-records: 500
+      # 【为什么给 45 秒】session.timeout.ms 管的是「心跳」，
+      # 不是 poll 间隔。默认值 10 秒在容器里偶尔会因 GC 抖动误判死掉。
+      # 调大它换取「不会无故重平衡」——
+      # 频繁重平衡会导致消费组反复从 earliest 重放，lag 曲线难看。
+      session.timeout.ms: 45000
     listener:
       # 手动提交，配合幂等实现「至少一次 + 最终只生效一次」
       ack-mode: manual_immediate
+    admin:
+      # 【M6 新增】用于查询 lag 与暂停/恢复消费组
+      # fail-fast：Kafka 不可用时不阻塞应用启动
+      fail-fast: false
 
 mybatis:
   configuration:
@@ -98,8 +130,18 @@ rtb:
   # 竞价总超时预算（毫秒），M5 熔断以此为总闸
   timeout-ms: 100
   kafka:
+    # 【M6】是否启用事件旁路。
+    # 关掉后行为与 M5 完全一致（只是少了旁路，不影响同步链路），
+    # 这样「回退到上一版本」不需要改代码。
+    enabled: true
     topic: bid_event
+    # 【为什么是 3】3 个分区能演示「同一 adId 路由到同一分区」的顺序性，
+    # 且 3 个分区已经能让消费组并行。
+    # 太多则单节点 Broker 压力大，且演示环境没有意义。
     partitions: 3
+  freq:
+    # 【M6】频次反作弊阈值：同一用户对同一广告，1 小时内超过此次数算异常
+    threshold: 5
   fallback:
     # 熔断故障注入开关 · M5
     # 生产必须为 false。打开后 /fallback/inject?delayMs=150 可主动

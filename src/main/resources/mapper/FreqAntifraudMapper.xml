@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.rtb.event.FreqAntifraudMapper">
+
+  <!--
+    小时频次打点。
+
+    【为什么是 cnt = cnt + 1 而不是「查了再写」】
+    前面已经解释过：并发下「先查再写」会丢更新。
+    唯一键 + 原子累加是数据库层的正确做法。
+
+    【重投 100 次会怎样】
+    cnt 只 +1，因为唯一键 (ad_id, user_id, stat_hour) 挡住了后续的插入。
+    这正是幂等的业务语义版本。
+
+    【为什么用户 ID 是 VARCHAR 而不是 BIGINT】
+    真实系统里 userId 是数值或设备指纹。本项目用 requestId 派生，
+    保持 VARCHAR 以便将来接设备指纹这类字符串 ID。
+  -->
+  <insert id="upsert">
+    INSERT INTO ad_freq_counter
+      (ad_id, user_id, stat_hour, cnt, updated_at)
+    VALUES
+      (#{adId}, #{userId}, #{statHour}, 1, #{updatedAt})
+    ON DUPLICATE KEY UPDATE
+      cnt        = cnt + 1,
+      updated_at = #{updatedAt}
+  </insert>
+
+</mapper>

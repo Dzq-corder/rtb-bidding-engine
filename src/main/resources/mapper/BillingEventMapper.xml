@@ -4,9 +4,9 @@
 <mapper namespace="com.rtb.bill.BillingEventMapper">
 
   <!--
-    写入计费事件。
-    event_id 唯一键冲突时抛DuplicateKey，由上层捕获后丢弃——
-    这就是消费端幂等的物理保障（M6 接 Kafka 后重投会撞这里）。
+    写入计费事件（M4 同步链路）。
+    同步侧不做ON DUPLICATE KEY——每次竞价都是新event_id，
+    撞唯一键说明代码有 bug，应当暴露而不是静默。
   -->
   <insert id="insert">
     INSERT INTO billing_event
@@ -16,5 +16,120 @@
       (#{eventId}, #{requestId}, #{adId}, #{advertiserId},
        #{bidPrice}, #{payPrice}, #{secondPrice}, #{isSecondPrice}, #{billedAt})
   </insert>
+
+  <!--
+    写入消费侧计费事件（M6 · billing-recon 消费组）。
+
+    【幂等的实现方式】
+    ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id)
+    ——命中唯一键时把 id 赋回自身，数据不变。
+
+    【为什么用 LAST_INSERT_ID(id) 而不是 event_id = event_id】
+    这是实测踩到的坑：原先写的是 event_id = event_id，
+    手工在 MySQL 里执行 ROW_COUNT() 确实返回 0，
+    但走 JDBC 时MyBatis 拿到的却是 1，
+    于是「重投」被误判成「新事件」，审计里全部记成 PROCESSED。
+
+    根因是 Connector/J 的 useAffectedRows 默认 false：
+    此时驱动返回的是 found_rows（匹配行数）而不是 affected_rows（变更行数）。
+    命中唯一键时虽然一行都没改，但「匹配到了 1 行」，
+    所以 found_rows = 1，判重逻辑完全失效。
+
+    LAST_INSERT_ID(expr) 是MySQL 的标准做法：
+    它把 expr 写进会话级 last_insert_id，
+    使 INSERT 成功后 LAST_INSERT_ID() 一定有值，
+    且重复键时仍返回原有行的 id——
+    Java 侧改成读「插入后表的行数是否变化」来判断，不再依赖驱动语义。
+
+    【为什么不改成全局 useAffectedRows=true】
+    改连接串会影响所有 Mapper 的返回值语义，
+    M4 的同步链路 insert 也返回 affected_rows，
+    一旦语义变化，扣费链路的判断依据也会跟着变——
+    为了一个判重去动全局配置，风险不划算。
+
+    【为什么不写成 INSERT IGNORE】
+    INSERT IGNORE 会把「唯一键冲突」和「字段截断/类型转换失败」等
+    多种错误统一吞掉，返回 0。我无法区分
+    「这是重投被跳过」和「数据有问题被丢掉了」——
+    后者是静默的数据丢失，比超扣更难发现。
+    ON DUPLICATE KEY UPDATE 只在唯一键冲突时触发，其他错误照常抛。
+
+    【为什么不先SELECT 再 INSERT】
+    并发消费下两个线程会同时查到 0，然后都插入。
+    唯一键是数据库层的原子操作，业务代码的 if 不是。
+
+    【为什么用 REPLACE 更差】
+    REPLACE = DELETE + INSERT，会真的删掉再插，
+    在有外键或自增关联的场景下有副作用，而且 binlog 里表现为
+    「删一行插一行」，对账时看不出是幂等还是业务真删除。
+  -->
+  <insert id="insertConsumerEvent">
+    INSERT INTO billing_event_consumer
+      (event_id, request_id, ad_id, advertiser_id,
+       bid_price, pay_price, second_price, is_second_price,
+       consumed_at, consumer_group)
+    VALUES
+      (#{event.eventId}, #{event.requestId}, #{event.adId}, #{event.advertiserId},
+       #{event.bidPrice}, #{event.payPrice}, #{event.secondPrice},
+       #{event.isSecondPrice},
+       #{consumedAt}, #{group})
+    ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id)
+  </insert>
+
+  <!--
+    判重：刚才那条 INSERT 到底是新增还是命中唯一键。
+
+    【为什么不直接用 insert 的返回值】
+    Connector/J 的 useAffectedRows 默认 false，
+    返回的是 found_rows（匹配行数）而不是 affected_rows（变更行数）。
+    命中唯一键时虽然一行都没改，但「匹配到了 1 行」，found_rows 依然是 1，
+    判重逻辑完全失效。详见 BillingEventMapper 的注释。
+
+    【判据：用字符串形式比较时间，绕开时区转换】
+    ON DUPLICATE KEY UPDATE 分支刻意<b>不更新 consumed_at</b>，
+    所以命中唯一键时这一列保留上一次消费的旧值；
+    只有真正新增的行才写入本次的 consumedAt。
+
+    【为什么必须用 DATE_FORMAT 转字符串再比，不能直接比时间列】
+    这是 M6 排查最久的一个坑，前后两次误判方向记录如下：
+
+    第一版写 {@code consumed_at = #{consumedAt}}，
+    结果 4738 条全新事件里 4733 条被判成「重复」。
+    改成字符串比较后症状<b>没有变化</b>——
+    说明根因不在比较方式，而在<b>数值本身</b>。
+
+    真正的根因是精度：
+    {@code LocalDateTime.now()} 在 Windows 上带<b>微秒</b>精度
+    （实测 nano=990405900，即 .990405），
+    而 consumed_at 列是 {@code datetime(3)}（毫秒），
+    MySQL 写入时把尾数四舍五入掉，存成 .990000。
+    于是 Java 侧拿 .990405 去比库里的 .990000，几乎永远不相等。
+    那 5 条「判对」的是亚毫秒恰好为 0 的幸运样本——
+    正因为有这 5 条才没被误认为是全盘逻辑错误。
+
+    修法在 Java 侧：{@code truncatedTo(ChronoUnit.MILLIS)}，
+    取时间时先截断到毫秒，写入与比较用同一个值。
+    这里仍保留字符串比较，是为了让两侧的字面量形状完全可控，
+    不再依赖驱动对 LocalDateTime 的绑定语义。
+
+    【为什么不加事务把 INSERT 和判重绑在一起】
+    理论上如果两个线程同时处理同一个 event_id，
+    两者 consumed_at 不同会导致都判成「新增」。
+    但这个前提在本项目不成立：
+    Kafka 保证同一分区内消息串行消费，且容器 concurrency = 1，
+    所以同一个 event_id 永远只被一个线程顺序处理。
+    <b>真实系统里如果提高消费并发度，就必须给这两步加事务</b>，
+    否则判重会失效。这里不开事务是因为并发前提不成立，
+    开事务反而多一次数据库往返。
+  -->
+  <select id="wasInserted" resultType="int">
+    SELECT CASE
+             WHEN DATE_FORMAT(consumed_at, '%Y-%m-%d %H:%i:%s.%f') = #{consumedAtStr}
+             THEN 1 ELSE 0
+           END
+    FROM billing_event_consumer
+    WHERE event_id = #{eventId}
+    LIMIT 1
+  </select>
 
 </mapper>

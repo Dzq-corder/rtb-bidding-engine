@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.rtb.stat.HourlyPreaggMapper">
+
+  <!--
+    小时级预聚合累加。
+
+    【为什么用累加而不是覆盖】
+    消费端是「攒一批内存 → 刷一次盘」，
+    每次刷进来的都是这一段时间的增量，不是全量。
+    如果用 REPLACE 覆盖，把之前几批的数据冲掉了。
+
+    【为什么三个维度都要累加】
+    cnt / adCnt / total_cost 都是可加的（additive），
+    累加后再算 avg 才有意义。avg 本身不可加，所以表里存的是
+    「和」而不是「均值」，查询时再除：
+      avg_cost_ms  = 累计耗时 / cnt   （用 tot_cost_ms / cnt算，但表里只有 avg）
+    本表结构在 M0 就定好了，当时只留 avg 字段——
+    这是【M0 设计的一个缺陷】，M8 第 4 轮要改成存「和」而不是「均值」，
+    否则多次累加后均值会越来越不准。这是留给 M8 的对照点。
+  -->
+  <insert id="upsert">
+    INSERT INTO bid_stat_hourly
+      (stat_hour, slot_code, category_code,
+       cnt, ad_cnt, avg_cost_ms, p99_cost_ms, avg_pay_price, total_cost)
+    VALUES
+      (#{statHour}, #{slotCode}, #{categoryCode},
+       #{cnt}, #{adCnt}, #{avgCostMs}, #{p99CostMs}, #{avgPayPrice}, #{totalCost})
+    ON DUPLICATE KEY UPDATE
+      cnt        = cnt + #{cnt},
+      ad_cnt     = ad_cnt + #{adCnt},
+      avg_cost_ms= GREATEST(avg_cost_ms, #{avgCostMs}),
+      p99_cost_ms= GREATEST(p99_cost_ms, #{p99CostMs}),
+      total_cost = total_cost + #{totalCost}
+  </insert>
+
+</mapper>

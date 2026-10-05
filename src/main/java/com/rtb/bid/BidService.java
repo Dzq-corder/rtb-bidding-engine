@@ -5,6 +5,8 @@ import com.rtb.ad.AdMapper;
 import com.rtb.bill.BillingEventMapper;
 import com.rtb.bill.SecondPriceBilling;
 import com.rtb.budget.BudgetService;
+import com.rtb.event.BidEvent;
+import com.rtb.event.EventProducer;
 import com.rtb.fallback.FallbackAdPool;
 import com.rtb.fallback.FaultInjector;
 import com.rtb.index.InvertedIndex;
@@ -76,6 +78,7 @@ public class BidService {
     private final BillingEventMapper billingEventMapper;
     private final FallbackAdPool fallbackAdPool;
     private final FaultInjector faultInjector;
+    private final EventProducer eventProducer;
 
     public BidService(AdMapper adMapper,
                       BidLogMapper bidLogMapper,
@@ -84,7 +87,8 @@ public class BidService {
                       SecondPriceBilling secondPriceBilling,
                       BillingEventMapper billingEventMapper,
                       FallbackAdPool fallbackAdPool,
-                      FaultInjector faultInjector) {
+                      FaultInjector faultInjector,
+                      EventProducer eventProducer) {
         this.adMapper = adMapper;
         this.bidLogMapper = bidLogMapper;
         this.budgetService = budgetService;
@@ -93,6 +97,7 @@ public class BidService {
         this.billingEventMapper = billingEventMapper;
         this.fallbackAdPool = fallbackAdPool;
         this.faultInjector = faultInjector;
+        this.eventProducer = eventProducer;
     }
 
     /**
@@ -372,10 +377,21 @@ public class BidService {
                 costMs, candidateCost, filterCost, sortCost, billCost);
 
         // 计费事件与竞价明细分级：明细可丢，钱不能丢
+        String chargeEventId = null;
         if (finalWinner != null) {
-            persistBillingEvent(requestId, finalWinner, finalPay, finalSecondPrice,
-                    finalIsSecondPrice);
+            chargeEventId = persistBillingEvent(requestId, finalWinner, finalPay,
+                    finalSecondPrice, finalIsSecondPrice);
         }
+
+        // ⑦ 事件旁路（M6）
+        //
+        // 【为什么放在最后】投递是「发出去了就算完成」，
+        // 放在所有同步逻辑之后，保证同步链路的结果已经落地。
+        // 反过来放的话，一旦后面的落库抛异常，
+        // 就会出现「事件说这次成交了，但表里没有」的脏数据。
+        publishEvent(chargeEventId, requestId, req, finalWinner, finalPay, finalSecondPrice,
+                finalIsSecondPrice, costMs, candidateCost, finalCandidateCnt,
+                finalMatchCnt);
 
         BidRequest.Result result = buildResult(requestId, candidates, matched,
                 finalWinner, finalPay, costMs, candidateCost, filterCost, sortCost, billCost);
@@ -421,10 +437,18 @@ public class BidService {
                 finalWinner, finalWinner == null ? null : finalWinner.getBid(),
                 costMs, candidateCost, filterCost, sortCost, billCost);
 
+        String chargeEventId = null;
         if (finalWinner != null) {
             // 兜底广告按一价结算，没有次高价概念
-            persistBillingEvent(requestId, finalWinner, finalWinner.getBid(), null, 0);
+            chargeEventId = persistBillingEvent(requestId, finalWinner,
+                    finalWinner.getBid(), null, 0);
         }
+
+        // 降级路径同样要发事件 —— 否则对账会误判为「事件丢失」
+        publishEvent(chargeEventId, requestId, req, finalWinner,
+                finalWinner == null ? null : finalWinner.getBid(),
+                null, 0, costMs, candidateCost,
+                matched.size(), matched.size());
 
         BidRequest.Result result = buildResult(requestId, matched, matched,
                 finalWinner, finalWinner == null ? null : finalWinner.getBid(),
@@ -432,6 +456,64 @@ public class BidService {
         result.setTimedOut(true);
         result.setFallback(finalWinner != null);
         return result;
+    }
+
+    /**
+     * 投递竞价事件到 Kafka 旁路 · M6
+     *
+     * <p><b>本方法的三条铁律</b>：
+     * <ol>
+     *   <li><b>不阻塞</b> —— 只注册回调，绝不调 {@code get()}/{@code join()}。
+     *       Kafka 假死时 {@code max.block.ms} 默认 60 秒，
+     *       阻塞就等于把 M5 精心设计的 100ms 预算全部作废</li>
+     *   <li><b>不抛异常</b> —— 事件投递失败不能让竞价返回 500。
+     *       理由和 M5 一样：为一个可补偿的事件搞挂同步链路是本末倒置</li>
+     *   <li><b>不在异常路径上执行</b> —— 只在正常流程末尾调用。
+     *       异常兜底路径（{@code emergencyFallback}）不投事件，
+     *       因为那条路径上的扣费本来就失败了，投出去只会污染对账</li>
+     * </ol>
+     *
+     * <p><b>为什么扣费成功才投事件</b>：
+     * 事件的意义是「对账的对照物」。如果扣费失败也发事件，
+     * 消费侧会记下一笔消费记录，而同步侧没有——
+     * 对账就会出现「消费表多于同步表」的差异，
+     * 而这个差异不是丢消息，是口径本身错了。**对账的前提是两侧口径一致。**
+     */
+    private void publishEvent(String chargeEventId, String requestId, BidRequest req,
+                              Ad winner, BigDecimal payPrice, BigDecimal secondPrice,
+                              int isSecondPrice, int costMs, int candidateCost,
+                              int candidateCnt, int matchCnt) {
+        if (winner == null || chargeEventId == null) {
+            // 没有广告 = 这次没成交，没有可对账的事实
+            return;
+        }
+        try {
+            BidEvent e = new BidEvent();
+            // 复用同步侧的 eventId——对账靠它逐条 JOIN
+            e.setEventId(chargeEventId);
+            e.setRequestId(requestId);
+            e.setAdId(winner.getId());
+            e.setAdvertiserId(winner.getAdvertiserId());
+            e.setSlotCode(req.getSlotCode());
+            e.setCategoryCode(winner.getCategoryCode());
+            e.setRegion(req.getRegion());
+            e.setBidPrice(winner.getBid());
+            e.setPayPrice(payPrice);
+            e.setSecondPrice(secondPrice);
+            e.setIsSecondPrice(isSecondPrice);
+            e.setCostMs(costMs);
+            e.setCandidateCnt(candidateCnt);
+            e.setMatchCnt(matchCnt);
+            e.setHasAd(true);
+            // 用户 ID：本项目用 requestId 前 8 位派生。
+            // 真实系统里应是真实的用户/设备 ID——
+            // 频次反作弊的准确性完全取决于这个字段的质量。
+            e.setUserId(requestId.substring(0, 8));
+            e.setBidAt(LocalDateTime.now());
+            eventProducer.publish(e);
+        } catch (Exception ex) {
+            log.error("构造/投递竞价事件失败 requestId={}: {}", requestId, ex.getMessage());
+        }
     }
 
     /**
@@ -461,12 +543,24 @@ public class BidService {
      * Kafka 重投时撞唯一键被识别丢弃，保证最终只生效一次。
      * M4 阶段是同步写入，还没有重投，但唯一键先建好，行为一致。
      */
-    private void persistBillingEvent(String requestId, Ad winner,
+    private String persistBillingEvent(String requestId, Ad winner,
                                      BigDecimal payPrice, BigDecimal secondPrice,
                                      int isSecondPrice) {
+        // eventId 先生成：同步表和事件旁路必须用<b>同一个</b> eventId。
+        //
+        // 【为什么这是对账能成立的前提】
+        // 对账 SQL 是按 event_id 逐条 JOIN 同步表和消费表的。
+        // 如果两边各自生成一个 UUID，JOIN 永远匹配不上，
+        // 对账会报「同步 5000 条、消费 5000 条、差异 5000 条」——
+        // 而实际上数据完全一致，只是对不上号。
+        //
+        // 【代价】支付等外部调用需要下游用自己的幂等键去重，
+        // 因为我们无法让外部系统认同我们的 eventId。
+        // 本项目不涉及外部支付，所以这样做是安全的。
+        String eventId = UUID.randomUUID().toString().replace("-", "");
         try {
             billingEventMapper.insert(
-                    UUID.randomUUID().toString().replace("-", ""),
+                    eventId,
                     requestId,
                     winner.getId(),
                     winner.getAdvertiserId(),
@@ -481,6 +575,11 @@ public class BidService {
             log.error("写入计费事件失败 requestId={} adId={} pay={}",
                     requestId, winner.getId(), payPrice, e);
         }
+        // 无论写成功还是失败都返回 eventId：
+        // 写成功时它是对账的 JOIN 键；写失败时事件侧带着它去消费，
+        // 消费表会比同步表多一条——【这个差异本身就是有价值的信号】，
+        // 它直接告诉排查者「同步侧这里丢了一笔」
+        return eventId;
     }
 
     /**

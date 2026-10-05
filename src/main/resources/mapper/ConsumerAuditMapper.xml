@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.rtb.event.ConsumerAuditMapper">
+
+  <!--
+    记一笔消费审计。
+
+    【为什么用INSERT IGNORE 而非普通 INSERT】
+    审计表不能成为新的故障点：审计写失败不能反过来影响业务消费。
+    而且审计本身允许重复（同一 offset 记两次不影响结论），
+    所以这里刻意不建唯一键——宁可多记一条，不可记漏一条。
+  -->
+  <insert id="record">
+    INSERT IGNORE INTO consumer_audit
+      (consumer_group, partition_no, offset_no, event_id,
+       action, cost_ms, processed_at)
+    VALUES
+      (#{group}, #{partition}, #{offset}, #{eventId},
+       #{action}, #{costMs}, #{processedAt})
+  </insert>
+
+  <!--
+    失败路径专用：绝不抛异常。
+    MyBatis 的异常包装成 RuntimeException，
+    这里整体 try-catch 掉，只打日志——
+    审计失败绝不能掩盖原始的业务故障。
+  -->
+  <insert id="recordSafe">
+    INSERT IGNORE INTO consumer_audit
+      (consumer_group, partition_no, offset_no, event_id,
+       action, cost_ms, processed_at)
+    VALUES
+      (#{group}, #{partition}, #{offset}, #{eventId},
+       #{action}, #{costMs}, #{processedAt})
+  </insert>
+
+</mapper>
