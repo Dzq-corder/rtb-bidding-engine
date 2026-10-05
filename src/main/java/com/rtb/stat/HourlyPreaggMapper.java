@@ -26,16 +26,19 @@ public interface HourlyPreaggMapper {
      * 1/2 的语义不可靠（见 BillingEventMapper 注释）。
      * 本方法不需要判重——累加逻辑在 SQL 里，数据库自己保证。
      *
-     * @param avgCostMs 平均耗时 = 累计耗时 / 事件数
+     * @param totCostMs 累计耗时<b>之和</b>，不是平均值。
+     *                  M8 第 4 轮修正：均值不可加，累加语义下会失真。
+     *                  平均耗时由查询侧 {@code SUM(tot_cost_ms)/SUM(cnt)} 现算。
      * @param p99CostMs 近似 P99，本轮取窗口内最大值
+     * @param totalPayPrice 成交总价<b>之和</b>，不是平均成交价（理由同上）
      */
     int upsert(@Param("statHour") LocalDateTime statHour,
                @Param("slotCode") String slotCode,
                @Param("categoryCode") String categoryCode,
                @Param("cnt") long cnt,
                @Param("adCnt") long adCnt,
-               @Param("avgCostMs") int avgCostMs,
+               @Param("totCostMs") long totCostMs,
                @Param("p99CostMs") int p99CostMs,
-               @Param("avgPayPrice") BigDecimal avgPayPrice,
+               @Param("totalPayPrice") BigDecimal totalPayPrice,
                @Param("totalCost") BigDecimal totalCost);
 }

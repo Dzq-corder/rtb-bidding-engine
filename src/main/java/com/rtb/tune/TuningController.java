@@ -34,8 +34,7 @@ public class TuningController {
     /**
      * 第 1 轮靶子查询：某广告位时间窗内各结果分布。
      *
-     * <p>{@code source=detail}（默认）查 1000 万行的 {@code bid_log}；
-     * {@code source=preagg} 查几十万行的 {@code bid_stat_hourly}（第 4 轮对照）。
+     * <p>{@code source=detail}（默认）查 1000 万行的 {@code bid_log}。
      */
     @GetMapping("/dash")
     public Map<String, Object> dash(
@@ -49,8 +48,8 @@ public class TuningController {
         List<Map<String, Object>> last = null;
         for (int i = 0; i < repeat; i++) {
             long t0 = System.nanoTime();
-            last = "preagg".equalsIgnoreCase(source)
-                    ? mapper.dashGroupByResultPreagg(slot, from, to)
+            last = "trade".equalsIgnoreCase(source)
+                    ? mapper.dashTradeDetail(slot, from, to)
                     : mapper.dashGroupByResult(slot, from, to);
             costs.add((System.nanoTime() - t0) / 1_000_000);
         }
@@ -69,6 +68,108 @@ public class TuningController {
         return m;
     }
 
+    /**
+     * M8 第 4 轮：大盘改查预聚合表前后的 A→B。
+     *
+     * <p>两侧口径必须完全等价，所以这个接口除了计时，还<b>逐项比对数字</b>。
+     * 预聚合快是没意义的——如果它算出来的数和明细表不一样，快的是错的。
+     */
+    @GetMapping("/dash/compare")
+    public Map<String, Object> dashCompare(
+            @RequestParam(defaultValue = "feed_top") String slot,
+            @RequestParam(defaultValue = "2026-09-24 00:00:00") String from,
+            @RequestParam(defaultValue = "2026-10-01 00:00:00") String to,
+            @RequestParam(defaultValue = "5") int repeat) {
+
+        Map<String, Object> a = timed(() -> mapper.dashTradeDetail(slot, from, to), repeat);
+        Map<String, Object> b = timed(() -> mapper.dashTradePreagg(slot, from, to), repeat);
+
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("slot", slot);
+        m.put("window", from + " ~ " + to);
+        m.put("repeat", repeat);
+        m.put("detail", a);
+        m.put("preagg", b);
+        m.put("speedup", round(((Number) a.get("minMs")).longValue()
+                / Math.max(1L, ((Number) b.get("minMs")).longValue())));
+        m.put("sameResult", sameNumbers((List<Map<String, Object>>) a.get("result"),
+                (List<Map<String, Object>>) b.get("result")));
+        return m;
+    }
+
+    /**
+     * 逐项按数值比较两侧结果。
+     *
+     * <p><b>为什么不能用 {@code Map.equals}</b>：
+     * 明细侧 {@code COUNT(*)} 返回 {@code Long}，
+     * 预聚合侧 {@code SUM(ad_cnt)} 返回 {@code BigDecimal}
+     * （MySQL 里 SUM 整数返回 DECIMAL）。
+     * 值明明都是 242158，对象 equals 却是 false——
+     * <b>用对象相等去判断"两个数字一样"是错的</b>，必须按数值比。
+     *
+     * <p>这个 bug 第一版就踩了：接口返回 {@code sameResult:false}，
+     * 但把两边的 result 打出来看，每个数字都完全一致。
+     */
+    private static boolean sameNumbers(List<Map<String, Object>> a,
+                                       List<Map<String, Object>> b) {
+        if (a == null || b == null || a.size() != b.size()) {
+            return false;
+        }
+        for (int i = 0; i < a.size(); i++) {
+            Map<String, Object> x = a.get(i);
+            Map<String, Object> y = b.get(i);
+            if (x.size() != y.size()) {
+                return false;
+            }
+            for (String k : x.keySet()) {
+                if (!y.containsKey(k)) {
+                    return false;
+                }
+                // ⚠️ 不能写成 !a.compareTo(b) == 0：
+                //    Java 里 ! 的优先级高于 ==，会被解析成 (!a.compareTo(b)) == 0
+                //    ——对 int 取 ! 再和 0 比，编译都过不了，逻辑也是错的。
+                if (toDecimal(x.get(k)).compareTo(toDecimal(y.get(k))) != 0) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    private static java.math.BigDecimal toDecimal(Object v) {
+        if (v == null) {
+            return java.math.BigDecimal.ZERO;
+        }
+        if (v instanceof java.math.BigDecimal bd) {
+            return bd;
+        }
+        return new java.math.BigDecimal(String.valueOf(v));
+    }
+
+    /** 跑 repeat 次，返回全部原始耗时 + min/avg + 最后一次的结果。 */
+    private Map<String, Object> timed(
+            java.util.function.Supplier<List<Map<String, Object>>> q, int repeat) {
+        List<Long> costs = new ArrayList<>();
+        List<Map<String, Object>> last = null;
+        for (int i = 0; i < repeat; i++) {
+            long t0 = System.nanoTime();
+            last = q.get();
+            costs.add((System.nanoTime() - t0) / 1_000_000);
+        }
+        long min = costs.stream().mapToLong(Long::longValue).min().orElse(0);
+        double avg = costs.stream().mapToLong(Long::longValue).average().orElse(0);
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("costMs", costs);
+        m.put("minMs", min);
+        m.put("avgMs", round(avg));
+        m.put("result", last);
+        return m;
+    }
+
+    private static double round(double v) {
+        return Math.round(v * 100.0) / 100.0;
+    }
+
     /** 取上面查询的执行计划。 */
     @GetMapping("/explain/dash")
     public Map<String, Object> explainDash(
@@ -76,10 +177,22 @@ public class TuningController {
             @RequestParam(defaultValue = "2026-10-05 20:00:00") String from,
             @RequestParam(defaultValue = "2026-10-05 21:00:00") String to,
             @RequestParam(defaultValue = "detail") String source) {
-        List<Map<String, Object>> rows = "preagg".equalsIgnoreCase(source)
-                ? mapper.explainDashGroupByResultPreagg(slot, from, to)
+        List<Map<String, Object>> rows = "trade".equalsIgnoreCase(source)
+                ? mapper.explainDashTradeDetail(slot, from, to)
                 : mapper.explainDashGroupByResult(slot, from, to);
         return pick(rows, source);
+    }
+
+    /** 第 4 轮两侧的执行计划对照。 */
+    @GetMapping("/explain/dash/compare")
+    public Map<String, Object> explainDashCompare(
+            @RequestParam(defaultValue = "feed_top") String slot,
+            @RequestParam(defaultValue = "2026-09-24 00:00:00") String from,
+            @RequestParam(defaultValue = "2026-10-01 00:00:00") String to) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("detail", pick(mapper.explainDashTradeDetail(slot, from, to), "detail"));
+        m.put("preagg", pick(mapper.explainDashTradePreagg(slot, from, to), "preagg"));
+        return m;
     }
 
     /**

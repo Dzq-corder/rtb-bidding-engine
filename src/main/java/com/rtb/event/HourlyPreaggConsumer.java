@@ -226,22 +226,19 @@ public class HourlyPreaggConsumer {
         int rows = 0;
         for (Accumulator a : snapshot.values()) {
             try {
-                // 均价 = 总价 / 成交数。
-                // 【为什么除 adCnt 而不是 cnt】cnt 是「竞价请求数」，
-                // adCnt 才是「有广告返回的次数」，也就是真正的成交数。
-                // 没有广告返回时 totalPayPrice 必然是 0，
-                // 此时除以 0 会抛 ArithmeticException，兜底成 0 即可。
-                java.math.BigDecimal avgPayPrice = (a.adCnt == 0)
-                        ? java.math.BigDecimal.ZERO
-                        : a.totalPayPrice.divide(
-                                java.math.BigDecimal.valueOf(a.adCnt), 2,
-                                java.math.RoundingMode.HALF_UP);
-
+                // 【M8 第 4 轮修正】这里原来算的是「平均成交价」再传进去。
+                // 但累加语义下均值会失真，而且 avg_pay_price 压根没进
+                // ON DUPLICATE KEY UPDATE 的列表，累加几批后就永远停在第一次的值。
+                // 现在直接传「和」，平均值由查询侧现算。
+                //
+                // 注意 total_cost 传的一直是 a.totalPayPrice（成交总价之和），
+                // 它本来就是可加的，所以这一列从来没出过问题——
+                // 出问题的是和它并列的 avg_pay_price。
                 rows += mapper.upsert(a.statHour, a.slotCode, a.categoryCode,
                         a.cnt, a.adCnt,
-                        (int) (a.totalCostMs / Math.max(a.cnt, 1)),
+                        a.totalCostMs,
                         a.maxCostMs,
-                        avgPayPrice,
+                        a.totalPayPrice,
                         a.totalPayPrice);
             } catch (Exception e) {
                 // 刷盘失败不抛：预聚合数据可重算，不能因此影响服务

@@ -37,19 +37,48 @@ public interface TuneMapper {
                                                        @Param("to") String to);
 
     /**
-     * M8 第 4 轮对照：同样口径的查询，但走小时级汇总表。
+     * M8 第 4 轮对照：同样口径的成交指标，但走小时级汇总表。
      *
-     * <p>注意这里的分组维度是 {@code stat_hour} 落在窗口内，
-     * 而不是 {@code bid_at}——汇总表的主键就是小时。
+     * <p>⚠️ <b>口径为什么必须是「成交维度」而不是「结果分布」</b>：
+     * {@code HourlyPreaggConsumer} 的数据源是 Kafka 事件流，而
+     * {@code BidService.publishEvent} 在没有胜出广告时直接 return
+     * ——空广告竞价根本不进 Kafka。所以预聚合表里
+     * {@code ad_cnt} 恒等于 {@code cnt}，{@code cnt - ad_cnt} 永远是 0，
+     * <b>这张表算不出空广告率</b>。
+     *
+     * <p>成交维度则两侧严格等价：
+     * <pre>
+     *   明细：  COUNT(*)                        WHERE has_ad = 1
+     *   汇总：  SUM(ad_cnt)
+     *   明细：  SUM(pay_price)                 WHERE has_ad = 1
+     *   汇总：  SUM(total_pay_price)
+     * </pre>
+     * 均价两边都是「总价 / 笔数」，只是汇总表要先 SUM 再除
+     * （这就是 M8 第 4 轮把 avg_pay_price 改成 total_pay_price 的原因）。
      */
-    List<Map<String, Object>> dashGroupByResultPreagg(@Param("slot") String slot,
-                                                      @Param("from") String from,
-                                                      @Param("to") String to);
+    List<Map<String, Object>> dashTradePreagg(@Param("slot") String slot,
+                                               @Param("from") String from,
+                                               @Param("to") String to);
 
     /** 同上，前缀 EXPLAIN。 */
-    List<Map<String, Object>> explainDashGroupByResultPreagg(@Param("slot") String slot,
-                                                             @Param("from") String from,
-                                                             @Param("to") String to);
+    List<Map<String, Object>> explainDashTradePreagg(@Param("slot") String slot,
+                                                     @Param("from") String from,
+                                                     @Param("to") String to);
+
+    /**
+     * M8 第 4 轮 · 明细侧的同口径查询（对照组）。
+     *
+     * <p>返回成交笔数与成交总价，用来和 {@link #dashTradePreagg} 逐项对账。
+     * 两边数字必须完全相等——不相等就说明回填口径错了，预聚合就不可信。
+     */
+    List<Map<String, Object>> dashTradeDetail(@Param("slot") String slot,
+                                              @Param("from") String from,
+                                              @Param("to") String to);
+
+    /** 同上，前缀 EXPLAIN。 */
+    List<Map<String, Object>> explainDashTradeDetail(@Param("slot") String slot,
+                                                    @Param("from") String from,
+                                                    @Param("to") String to);
 
     // =================================================================
     // M8 第 2 轮 · 深分页

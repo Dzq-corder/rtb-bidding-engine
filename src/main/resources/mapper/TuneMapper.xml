@@ -43,30 +43,63 @@
   </select>
 
   <!--
-    M8 第 4 轮 · 对照查询（走小时级汇总表）
+    M8 第 4 轮 · 明细侧（对照组）
     ===
-    口径与上面完全一致，只是数据源从 1000 万行的 bid_log
-    换成几十万行的 bid_stat_hourly。
-
-    汇总表里没有 has_ad 列，空广告数 = cnt - ad_cnt。
-    这一点必须在面试时说清楚——两个口径的等价关系不是凭空来的，
-    而是 ad_cnt 的定义（返回广告数）决定的。
+    口径：某广告位在时间窗内的成交笔数、成交总价、平均成交价。
+    只取 has_ad = 1，因为预聚合表只能看到有胜出广告的事件。
   -->
-  <select id="dashGroupByResultPreagg" resultType="java.util.LinkedHashMap">
-    SELECT SUM(ad_cnt) AS ad_cnt,
-           SUM(cnt - ad_cnt) AS empty_cnt,
-           SUM(cnt) AS total_cnt
+  <select id="dashTradeDetail" resultType="java.util.LinkedHashMap">
+    SELECT COUNT(*) AS deals,
+           ROUND(SUM(pay_price), 2) AS amount,
+           ROUND(SUM(pay_price) / COUNT(*), 2) AS avg_price
+    FROM bid_log
+    WHERE slot_code = #{slot}
+      AND has_ad = 1
+      AND bid_at &gt;= #{from}
+      AND bid_at &lt; #{to}
+  </select>
+
+  <select id="explainDashTradeDetail" resultType="java.util.LinkedHashMap">
+    EXPLAIN
+    SELECT COUNT(*) AS deals,
+           ROUND(SUM(pay_price), 2) AS amount,
+           ROUND(SUM(pay_price) / COUNT(*), 2) AS avg_price
+    FROM bid_log
+    WHERE slot_code = #{slot}
+      AND has_ad = 1
+      AND bid_at &gt;= #{from}
+      AND bid_at &lt; #{to}
+  </select>
+
+  <!--
+    M8 第 4 轮 · 预聚合侧（优化后）
+    ===
+    与上面口径严格等价：
+      COUNT(*)        <=> SUM(ad_cnt)
+      SUM(pay_price)  <=> SUM(total_pay_price)
+      均价             <=> 先 SUM 再除（这就是把 avg_pay_price
+                          改成 total_pay_price 的原因——均值不可加）
+
+    ⚠️ 这里刻意没有「空广告数」这一项。
+      预聚合表的数据源是 Kafka 事件流，而空广告竞价根本不进 Kafka，
+      ad_cnt 恒等于 cnt，cnt - ad_cnt 永远是 0。
+      **这不是 SQL 写得不好，是 M6 的设计后果：预聚合表算不出空广告率。**
+  -->
+  <select id="dashTradePreagg" resultType="java.util.LinkedHashMap">
+    SELECT SUM(ad_cnt) AS deals,
+           ROUND(SUM(total_pay_price), 2) AS amount,
+           ROUND(SUM(total_pay_price) / SUM(ad_cnt), 2) AS avg_price
     FROM bid_stat_hourly
     WHERE slot_code = #{slot}
       AND stat_hour &gt;= #{from}
       AND stat_hour &lt; #{to}
   </select>
 
-  <select id="explainDashGroupByResultPreagg" resultType="java.util.LinkedHashMap">
+  <select id="explainDashTradePreagg" resultType="java.util.LinkedHashMap">
     EXPLAIN
-    SELECT SUM(ad_cnt) AS ad_cnt,
-           SUM(cnt - ad_cnt) AS empty_cnt,
-           SUM(cnt) AS total_cnt
+    SELECT SUM(ad_cnt) AS deals,
+           ROUND(SUM(total_pay_price), 2) AS amount,
+           ROUND(SUM(total_pay_price) / SUM(ad_cnt), 2) AS avg_price
     FROM bid_stat_hourly
     WHERE slot_code = #{slot}
       AND stat_hour &gt;= #{from}
@@ -74,7 +107,6 @@
   </select>
 
   <!--
-    ================================================================
     M8 第 2 轮 · 深分页
     ================================================================
     三种写法，同一个锚点（第 offset 条），返回同一页 20 行。

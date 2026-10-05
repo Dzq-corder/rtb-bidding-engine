@@ -147,17 +147,36 @@ CREATE TABLE billing_event (
 -- 关于 p99_cost_ms：SQL 的 AVG/COUNT 无法算出分位数。
 --   该列由消费端在内存滑动窗口内算出后随小时汇总一起落库，
 --   不是对明细表做 SQL 聚合得到的。
+--
+-- ⚠️ M8 第 4 轮修正（M0 遗留缺陷，M0 当时就标注在这里）：
+--   原表存的是 avg_cost_ms（平均耗时）和 avg_pay_price（平均成交价）。
+--   **均值不可加**，而消费端的写入语义是「累加」——
+--   同一小时同一组合会被刷多次，累加时「各批均值的均值」不等于「整体均值」。
+--   M0 的 upsert 只能拿 GREATEST 硬凑（取各批最大值），avg_pay_price 干脆
+--   根本没进 ON DUPLICATE KEY UPDATE 列表，累加几批之后就永远停在第一次的值。
+--   修法：**表里只存可加的「和」，查询时再除**。
+--     avg_cost_ms   → tot_cost_ms     （累计耗时，查询时 / cnt 得平均耗时）
+--     avg_pay_price → total_pay_price （成交总价，查询时 / ad_cnt 得平均成交价）
+--   这也是 M0 注释里写的「表里存和、查询时再除」，只是当时表结构没跟上。
 -- ---------------------------------------------------------------------
 DROP TABLE IF EXISTS bid_stat_hourly;
 CREATE TABLE bid_stat_hourly (
-  stat_hour     DATETIME NOT NULL COMMENT '整点小时',
-  slot_code     VARCHAR(32) NOT NULL COMMENT '广告位',
-  category_code VARCHAR(32) NOT NULL COMMENT '行业类目',
-  cnt           BIGINT UNSIGNED NOT NULL COMMENT '竞价请求数',
-  ad_cnt        BIGINT UNSIGNED NOT NULL COMMENT '返回广告数，cnt - ad_cnt 即空广告数',
-  avg_cost_ms   INT NOT NULL COMMENT '平均耗时',
-  p99_cost_ms   INT NOT NULL COMMENT 'P99 耗时，消费端内存滑动窗口计算',
-  avg_pay_price DECIMAL(10,2) NOT NULL COMMENT '平均成交价',
-  total_cost    DECIMAL(14,2) NOT NULL COMMENT '总消耗',
+  stat_hour       DATETIME NOT NULL COMMENT '整点小时',
+  slot_code       VARCHAR(32) NOT NULL COMMENT '广告位',
+  category_code   VARCHAR(32) NOT NULL COMMENT '行业类目',
+  cnt             BIGINT UNSIGNED NOT NULL COMMENT '成交笔数（= 事件数，见下方口径警告）',
+  ad_cnt          BIGINT UNSIGNED NOT NULL COMMENT '有广告返回的笔数',
+  tot_cost_ms     BIGINT UNSIGNED NOT NULL COMMENT '累计耗时之和，查询时 / cnt 得平均耗时（均值不可加，故存和）',
+  p99_cost_ms     INT NOT NULL COMMENT 'P99 耗时近似值，消费端取窗口内最大值',
+  total_pay_price DECIMAL(14,2) NOT NULL COMMENT '成交总价之和，查询时 / ad_cnt 得平均成交价（均值不可加，故存和）',
+  total_cost      DECIMAL(14,2) NOT NULL COMMENT '总消耗',
   PRIMARY KEY (stat_hour, slot_code, category_code)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='小时级预聚合大盘';
+
+-- ⚠️ 口径警告（M8 第 4 轮实测发现，M6 设计的直接后果）：
+--   这张表的数据源是 Kafka 事件流，而 BidService.publishEvent 在
+--   「没有胜出广告」时直接 return —— **空广告竞价根本不进 Kafka**。
+--   所以本表的 cnt 实际是「成交笔数」，ad_cnt 恒等于 cnt，
+--   **cnt - ad_cnt 永远是 0，预聚合表算不出空广告率**。
+--   要统计空广告率只能回明细表（bid_log.has_ad = 0），
+--   这正是 M7「明细可丢」要等到第 4 轮之后才成立的原因。

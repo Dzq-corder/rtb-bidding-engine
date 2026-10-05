@@ -11,28 +11,32 @@
     每次刷进来的都是这一段时间的增量，不是全量。
     如果用 REPLACE 覆盖，把之前几批的数据冲掉了。
 
-    【为什么三个维度都要累加】
-    cnt / adCnt / total_cost 都是可加的（additive），
-    累加后再算 avg 才有意义。avg 本身不可加，所以表里存的是
-    「和」而不是「均值」，查询时再除：
-      avg_cost_ms  = 累计耗时 / cnt   （用 tot_cost_ms / cnt算，但表里只有 avg）
-    本表结构在 M0 就定好了，当时只留 avg 字段——
-    这是【M0 设计的一个缺陷】，M8 第 4 轮要改成存「和」而不是「均值」，
-    否则多次累加后均值会越来越不准。这是留给 M8 的对照点。
+    【M8 第 4 轮修正：表里只存可加的量】
+    原来是 avg_cost_ms / avg_pay_price 两个均值列，这里传的是平均值。
+    但累加语义下均值会失真：
+      - avg_cost_ms   原来用 GREATEST 硬凑 = 取各批平均值里的最大值
+      - avg_pay_price 原来根本不在 UPDATE 列表里，累加几批后永远停在第一次的值
+    两列都改成「和」：tot_cost_ms / total_pay_price，
+    平均值由查询侧 SUM(...) / SUM(cnt) 现算。
+
+    ⚠️ 这两列是 M0 结构留下的坑，M0 的注释里其实已经预见了
+      （「avg 本身不可加，所以表里存的是和」），只是表结构没跟上。
+      没有这个缺陷，第 4 轮的预聚合对照在数值上根本对不上明细表。
   -->
   <insert id="upsert">
     INSERT INTO bid_stat_hourly
       (stat_hour, slot_code, category_code,
-       cnt, ad_cnt, avg_cost_ms, p99_cost_ms, avg_pay_price, total_cost)
+       cnt, ad_cnt, tot_cost_ms, p99_cost_ms, total_pay_price, total_cost)
     VALUES
       (#{statHour}, #{slotCode}, #{categoryCode},
-       #{cnt}, #{adCnt}, #{avgCostMs}, #{p99CostMs}, #{avgPayPrice}, #{totalCost})
+       #{cnt}, #{adCnt}, #{totCostMs}, #{p99CostMs}, #{totalPayPrice}, #{totalCost})
     ON DUPLICATE KEY UPDATE
-      cnt        = cnt + #{cnt},
-      ad_cnt     = ad_cnt + #{adCnt},
-      avg_cost_ms= GREATEST(avg_cost_ms, #{avgCostMs}),
-      p99_cost_ms= GREATEST(p99_cost_ms, #{p99CostMs}),
-      total_cost = total_cost + #{totalCost}
+      cnt             = cnt + #{cnt},
+      ad_cnt          = ad_cnt + #{adCnt},
+      tot_cost_ms     = tot_cost_ms + #{totCostMs},
+      p99_cost_ms     = GREATEST(p99_cost_ms, #{p99CostMs}),
+      total_pay_price = total_pay_price + #{totalPayPrice},
+      total_cost      = total_cost + #{totalCost}
   </insert>
 
 </mapper>
