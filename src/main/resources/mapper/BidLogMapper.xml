@@ -32,6 +32,37 @@
   </insert>
 
   <!--
+    M7 批量写入：多值 INSERT
+    ===
+    与上面的单条 INSERT 刻意分成两个方法，理由写在 BidLogMapper#insertBatch 的注释里：
+    这是「明细可丢、可批量」与「计费不可丢、逐条」两条策略的分界线，不能合并。
+
+    rewriteBatchedStatements=true 已在连接串里（M0 就开了），
+    这里的多值 INSERT 本身就是一条语句，一条语句一次往返。
+
+    批大小 500 是配置值（rtb.log.batch-size），受 max_allowed_packet 约束：
+    500 行 × 约 200 字节 ≈ 100KB，远低于默认 4MB。
+  -->
+  <insert id="insertBatch" parameterType="java.util.List">
+    INSERT INTO bid_log (
+      request_id, ad_id, advertiser_id, slot_code,
+      region, age, gender, interests,
+      candidate_cnt, match_cnt, has_ad, win_bid, pay_price,
+      cost_ms, candidate_cost, filter_cost, sort_cost, bill_cost,
+      bid_at
+    ) VALUES
+    <foreach collection="list" item="i" separator=",">
+      (
+        #{i.requestId}, #{i.adId}, #{i.advertiserId}, #{i.slotCode},
+        #{i.region}, #{i.age}, #{i.gender}, #{i.interests},
+        #{i.candidateCnt}, #{i.matchCnt}, #{i.hasAd}, #{i.winBid}, #{i.payPrice},
+        #{i.costMs}, #{i.candidateCost}, #{i.filterCost}, #{i.sortCost}, #{i.billCost},
+        #{i.bidAt}
+      )
+    </foreach>
+  </insert>
+
+  <!--
     以下统计仅用于 baseline 采集与演示看板，不加索引。
     大表上的这类查询正是 M8 第 1 轮（覆盖索引）与第 3 轮（分区裁剪）的靶子：
     现在走全表扫描 + Using temporary，M8 之后变成 Using index + 只扫命中分区。

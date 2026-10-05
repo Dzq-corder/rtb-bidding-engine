@@ -142,6 +142,19 @@ rtb:
   freq:
     # 【M6】频次反作弊阈值：同一用户对同一广告，1 小时内超过此次数算异常
     threshold: 5
+  log:
+    # 【M7】批量刷盘开关。
+    # false = 退回 M1 的同步逐条写，用来采集「写入吞吐由 A 提升至 B」里的 A。
+    # 没有 A 就没有对照，只报一个优化后的数字没有说服力。
+    batch-enabled: true
+    # 队列容量。有界是硬要求：无界队列的失败模式是 OOM，
+    # 而拖垮的是竞价主进程本身。
+    queue-capacity: 10000
+    # 单批上限 500 条。500 行 × 约 200B ≈ 100KB，远低于 max_allowed_packet 默认 4MB。
+    batch-size: 500
+    # 攒批最长等待。注意是「最长等待」不是固定节奏：
+    # 有数据就立刻取，不为了凑满一批而故意拖延。
+    flush-interval-ms: 200
   fallback:
     # 熔断故障注入开关 · M5
     # 生产必须为 false。打开后 /fallback/inject?delayMs=150 可主动

@@ -10,6 +10,7 @@ import com.rtb.event.EventProducer;
 import com.rtb.fallback.FallbackAdPool;
 import com.rtb.fallback.FaultInjector;
 import com.rtb.index.InvertedIndex;
+import com.rtb.log.BidLogBuffer;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
@@ -71,7 +72,16 @@ public class BidService {
     private static final int TOTAL_TIMEOUT_MS = 100;
 
     private final AdMapper adMapper;
-    private final BidLogMapper bidLogMapper;
+
+    /**
+     * 竞价明细写入缓冲 · M7
+     *
+     * <p><b>它只负责 {@code bid_log}</b>。{@code billing_event} 仍由
+     * {@link #persistBillingEvent} 同步逐条写，不经过这里——
+     * 见 {@link BidLogBuffer} 类注释里「两类数据两条写入路径」的说明。
+     */
+    private final BidLogBuffer logBuffer;
+
     private final BudgetService budgetService;
     private final InvertedIndex invertedIndex;
     private final SecondPriceBilling secondPriceBilling;
@@ -81,7 +91,7 @@ public class BidService {
     private final EventProducer eventProducer;
 
     public BidService(AdMapper adMapper,
-                      BidLogMapper bidLogMapper,
+                      BidLogBuffer logBuffer,
                       BudgetService budgetService,
                       InvertedIndex invertedIndex,
                       SecondPriceBilling secondPriceBilling,
@@ -90,7 +100,7 @@ public class BidService {
                       FaultInjector faultInjector,
                       EventProducer eventProducer) {
         this.adMapper = adMapper;
-        this.bidLogMapper = bidLogMapper;
+        this.logBuffer = logBuffer;
         this.budgetService = budgetService;
         this.invertedIndex = invertedIndex;
         this.secondPriceBilling = secondPriceBilling;
@@ -369,8 +379,9 @@ public class BidService {
         }
 
         // ---------------------------------------------------------
-        // ⑥ 落库：bid_log 同步逐条INSERT（M7 改批量）
-        //    billing_event 记录金钱事实，与 bid_log 分级
+        // ⑥ 落库：bid_log 入本地有界队列（M7），异步批量刷盘
+        //    billing_event 记录金钱事实，【同步逐条写，不走队列】
+        //    两条路径并存 = 「按业务后果分级」在代码里的体现
         // ---------------------------------------------------------
         persistLog(requestId, req, finalCandidateCnt, finalMatchCnt,
                 finalAdId, finalAdvertiserId, finalWinner, finalPay,
@@ -583,8 +594,17 @@ public class BidService {
     }
 
     /**
-     * 写竞价明细。M1 同步逐条 INSERT，异常不向上抛——
-     * 明细是可丢数据（M7 会显式定义丢弃策略），不能因日志失败影响竞价返回。
+     * 写竞价明细 —— M7 起改为「入队即返回」。
+     *
+     * <p><b>这里不做任何 IO</b>：只把对象放进有界队列，
+     * 由 {@link BidLogBuffer} 的刷盘线程批量落库。
+     * 竞价主链路的耗时里从此不再包含一次 MySQL 往返。
+     *
+     * <p><b>为什么这里可以是「可丢」的</b>：明细用于大盘分析，
+     * 丢几条不影响统计结论。而 {@link #persistBillingEvent} 是扣费事实，
+     * 必须同步写成功才返回。<b>两者的区别不是技术方案高低，是业务后果不同。</b>
+     *
+     * <p>异常不向上抛——明细可丢，绝不能因日志失败影响广告返回。
      */
     private void persistLog(String requestId, BidRequest req,
                             int candidateCnt, int matchCnt,
@@ -613,10 +633,10 @@ public class BidService {
             entity.setSortCost(sortCost);
             entity.setBillCost(billCost);
             entity.setBidAt(LocalDateTime.now());
-            bidLogMapper.insert(entity);
+            logBuffer.submit(entity);
         } catch (Exception e) {
             // 明细可丢，这里只告警不影响竞价结果返回
-            log.warn("写入竞价明细失败 requestId={}", requestId, e);
+            log.warn("提交竞价明细失败 requestId={}", requestId, e);
         }
     }
 
