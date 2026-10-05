@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.rtb.tune.TuneMapper">
+
+  <!--
+    M8 第 1 轮 · 靶子查询
+    ===
+    某广告位在给定时间窗内的各结果分布（有广告 / 空广告）。
+
+    优化前：bid_log 上没有任何二级索引，只有主键 id。
+    这条查询只能全表扫 1000 万行，再对结果做 GROUP BY（Using temporary）。
+
+    优化后：加覆盖索引 idx_slot_result_time(slot_code, has_ad, bid_at)，
+    查询所需三列全在索引里 → Using index，且索引已按 (has_ad) 有序
+    → GROUP BY 不需要临时表。
+
+    ⚠️ timeout=600 的原因（这是调优脚手架，不是业务链路）：
+    优化前这条语句全表扫 1000 万行，实测超过了 DataSource 上配置的
+    默认语句超时，直接被 MySQL 取消，拿不到耗时数字。
+    为了把「优化前的 A」量出来，这里单独放宽到 600 秒。
+    业务链路的超时一个字都不动——放宽的只是观测用的这条。
+    优化后耗时降到毫秒级，这个 timeout 不会再触发。
+  -->
+  <select id="dashGroupByResult" resultType="java.util.LinkedHashMap" timeout="600">
+    SELECT has_ad, COUNT(*) AS cnt
+    FROM bid_log
+    WHERE slot_code = #{slot}
+      AND bid_at &gt;= #{from}
+      AND bid_at &lt; #{to}
+    GROUP BY has_ad
+  </select>
+
+  <select id="explainDashGroupByResult" resultType="java.util.LinkedHashMap">
+    EXPLAIN
+    SELECT has_ad, COUNT(*) AS cnt
+    FROM bid_log
+    WHERE slot_code = #{slot}
+      AND bid_at &gt;= #{from}
+      AND bid_at &lt; #{to}
+    GROUP BY has_ad
+  </select>
+
+  <!--
+    M8 第 4 轮 · 对照查询（走小时级汇总表）
+    ===
+    口径与上面完全一致，只是数据源从 1000 万行的 bid_log
+    换成几十万行的 bid_stat_hourly。
+
+    汇总表里没有 has_ad 列，空广告数 = cnt - ad_cnt。
+    这一点必须在面试时说清楚——两个口径的等价关系不是凭空来的，
+    而是 ad_cnt 的定义（返回广告数）决定的。
+  -->
+  <select id="dashGroupByResultPreagg" resultType="java.util.LinkedHashMap">
+    SELECT SUM(ad_cnt) AS ad_cnt,
+           SUM(cnt - ad_cnt) AS empty_cnt,
+           SUM(cnt) AS total_cnt
+    FROM bid_stat_hourly
+    WHERE slot_code = #{slot}
+      AND stat_hour &gt;= #{from}
+      AND stat_hour &lt; #{to}
+  </select>
+
+  <select id="explainDashGroupByResultPreagg" resultType="java.util.LinkedHashMap">
+    EXPLAIN
+    SELECT SUM(ad_cnt) AS ad_cnt,
+           SUM(cnt - ad_cnt) AS empty_cnt,
+           SUM(cnt) AS total_cnt
+    FROM bid_stat_hourly
+    WHERE slot_code = #{slot}
+      AND stat_hour &gt;= #{from}
+      AND stat_hour &lt; #{to}
+  </select>
+
+</mapper>
