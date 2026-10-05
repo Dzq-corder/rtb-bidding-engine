@@ -73,4 +73,117 @@
       AND stat_hour &lt; #{to}
   </select>
 
+  <!--
+    ================================================================
+    M8 第 2 轮 · 深分页
+    ================================================================
+    三种写法，同一个锚点（第 offset 条），返回同一页 20 行。
+    排序键统一是 (bid_at DESC, has_ad DESC, id DESC)——
+    与索引 (slot_code, bid_at, has_ad) + 隐式追加的 id 完全一致，
+    所以 A / C 都能走 Backward index scan，不产生 filesort。
+
+    ⚠️ 为什么不能用 ORDER BY bid_at DESC, id DESC：
+    索引里 has_ad 夹在 bid_at 和 id 之间，
+    加上 id 会打断前缀 → Using filesort（实测确认）。
+    ================================================================
+  -->
+
+  <!-- 锚点：只在计时外跑一次 -->
+  <select id="cursorAt" resultType="java.util.LinkedHashMap">
+    SELECT bid_at, has_ad, id
+    FROM bid_log
+    WHERE slot_code = #{slot}
+    ORDER BY bid_at DESC, has_ad DESC, id DESC
+    LIMIT #{offset}, 1
+  </select>
+
+  <!-- A：直查深分页。SELECT 里刻意带上索引外的列，逼出逐行回表 -->
+  <select id="pageOffset" resultType="java.util.LinkedHashMap">
+    SELECT id, slot_code, has_ad, bid_at, request_id, cost_ms, pay_price
+    FROM bid_log
+    WHERE slot_code = #{slot}
+    ORDER BY bid_at DESC
+    LIMIT #{offset}, #{limit}
+  </select>
+
+  <!--
+    B：延迟关联（deferred join）
+    内层只查 id → 覆盖索引，被跳过的 10 万行不回表；
+    外层只对最终 20 行按主键回表。
+    保留跳页能力，代价仍与 offset 线性相关。
+  -->
+  <select id="pageDeferred" resultType="java.util.LinkedHashMap">
+    SELECT b.id, b.slot_code, b.has_ad, b.bid_at, b.request_id, b.cost_ms, b.pay_price
+    FROM bid_log b
+    JOIN (SELECT id
+          FROM bid_log
+          WHERE slot_code = #{slot}
+          ORDER BY bid_at DESC
+          LIMIT #{offset}, #{limit}) t ON t.id = b.id
+    ORDER BY b.bid_at DESC
+  </select>
+
+  <!--
+    C：游标翻页
+
+    ⚠️⚠️ 这里有一个必须记住的坑（本轮最重要的发现）：
+    只写行值比较 (bid_at, has_ad, id) <= (...) 是不够的。
+    EXPLAIN FORMAT=TREE 显示它被当成 Filter 套在完整倒扫之上：
+
+        -> Filter: ((bid_at,has_ad,id) <= (...))  (rows=4.94e+6)
+            -> Covering index lookup on idx_slot_time_result (slot_code='feed_top') (reverse)
+
+    也就是说 MySQL 会把该广告位的 494 万条索引项全部倒扫一遍再过滤，
+    ——实测 198 ms，和不优化的直查（191 ms）几乎一样，游标白写了。
+
+    修法：额外加一个 bid_at &lt;= #{bidAt} 的普通范围条件作为 range 起点。
+    加完之后 type 由 ref 变 range、key_len 由 130 变 137（多出的 7 字节是 datetime(3)），
+    倒扫可以直接定位到锚点，只扫 20 行。
+
+    行值比较仍然要保留：它负责 bid_at 相同的那些行里的 (has_ad, id) 次序，
+    少了它翻页会在毫秒级重复的时间戳上漏行/重行。
+    两个条件不冗余——一个管"跳到哪"，一个管"边界内的次序"。
+  -->
+  <select id="pageCursor" resultType="java.util.LinkedHashMap">
+    SELECT id, slot_code, has_ad, bid_at, request_id, cost_ms, pay_price
+    FROM bid_log
+    WHERE slot_code = #{slot}
+      AND bid_at &lt;= #{bidAt}
+      AND (bid_at, has_ad, id) &lt;= (#{bidAt}, #{hasAd}, #{lastId})
+    ORDER BY bid_at DESC, has_ad DESC, id DESC
+    LIMIT #{limit}
+  </select>
+
+  <select id="explainPageOffset" resultType="java.util.LinkedHashMap">
+    EXPLAIN
+    SELECT id, slot_code, has_ad, bid_at, request_id, cost_ms, pay_price
+    FROM bid_log
+    WHERE slot_code = #{slot}
+    ORDER BY bid_at DESC
+    LIMIT #{offset}, #{limit}
+  </select>
+
+  <select id="explainPageDeferred" resultType="java.util.LinkedHashMap">
+    EXPLAIN
+    SELECT b.id, b.slot_code, b.has_ad, b.bid_at, b.request_id, b.cost_ms, b.pay_price
+    FROM bid_log b
+    JOIN (SELECT id
+          FROM bid_log
+          WHERE slot_code = #{slot}
+          ORDER BY bid_at DESC
+          LIMIT #{offset}, #{limit}) t ON t.id = b.id
+    ORDER BY b.bid_at DESC
+  </select>
+
+  <select id="explainPageCursor" resultType="java.util.LinkedHashMap">
+    EXPLAIN
+    SELECT id, slot_code, has_ad, bid_at, request_id, cost_ms, pay_price
+    FROM bid_log
+    WHERE slot_code = #{slot}
+      AND bid_at &lt;= #{bidAt}
+      AND (bid_at, has_ad, id) &lt;= (#{bidAt}, #{hasAd}, #{lastId})
+    ORDER BY bid_at DESC, has_ad DESC, id DESC
+    LIMIT #{limit}
+  </select>
+
 </mapper>
