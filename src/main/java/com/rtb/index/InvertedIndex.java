@@ -15,6 +15,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 内存倒排索引 · M2
@@ -58,7 +59,25 @@ public class InvertedIndex {
      * 会超时（实测报 MySQLTimeoutException），而索引加载时本来就把每行读进来了，
      * 顺手计数几乎零成本。
      */
-    private final Map<Long, Integer> adTargetCount = new HashMap<>();
+    private final Map<Long, Integer> adTargetCount = new ConcurrentHashMap<>();
+
+    /**
+     * 反向表：广告 ID -&gt; 它命中的全部索引 key · M9
+     *
+     * <p><b>为什么必须有这张表</b>：
+     * 正向表是「取值 → 广告数组」，方向天然是「给定条件找广告」。
+     * 但管理端要回答的是反过来的问题：<b>「我改了广告 X 的定向，
+     * 它原来命中了哪些 key？该从哪些数组里把它摘掉？」</b>
+     * 没有这张表就只能遍历全部 4,844 个 key 去反查，
+     * 为了改 1 条定向做 4,844 次比较——能跑，但明显是错工具。
+     *
+     * <p>这也是「正向索引必然需要反向表」的一个具体例子：
+     * 写入时按正向键组织，读入时却经常要按反向键提问。
+     *
+     * <p>key 格式 "{dimType} {dimValue}"，与 {@link #key} 一致。
+     * 值为不可变集合，增删都靠整体替换而非原地改。
+     */
+    private final Map<Long, Set<String>> adTargetKeys = new ConcurrentHashMap<>();
 
     /** 某条广告的定向条件条数；不在索引里返回 0 */
     public int targetCountOf(Long adId) {
@@ -79,11 +98,18 @@ public class InvertedIndex {
      *
      * <p>用嵌套 Map 而非拼接字符串：拼接会产生 4,844 个临时 String，
      * 嵌套 Map 零字符串分配。
+     *
+     * <p><b>为什么是 ConcurrentHashMap（M9 起）</b>：
+     * 原本是 HashMap，启动后只读所以安全。M9 加了「改定向即时生效」后，
+     * 投放端会在竞价线程读的同时往里 put——而 HashMap 在 put 触发扩容时
+     * 可能让并发 get 死循环（著名的 HashMap 扩容 race）。
+     * <b>这不是「理论上有风险」，是真实会挂的故障模式</b>，
+     * 演示时改一次定向就可能让整个竞价接口卡住。
      */
-    private final Map<Integer, Map<String, int[]>> index = new HashMap<>();
+    private final Map<Integer, Map<String, int[]>> index = new ConcurrentHashMap<>();
 
-    /** 广告ID -> 广告详情，M2 起常驻内存，省掉每次回表 */
-    private final Map<Long, Ad> adCache = new HashMap<>();
+    /** 同上，adCache 也要并发安全：改预算会替换其中的 Ad 对象 */
+    private final Map<Long, Ad> adCache = new ConcurrentHashMap<>();
 
     /**
      * 加载期的全局累积区：key -> 广告 ID 集合。
@@ -165,10 +191,14 @@ public class InvertedIndex {
      */
     private int indexBatch(List<TargetRow> batch) {
         for (TargetRow r : batch) {
-            String key = r.dimType() + ":" + r.dimValue();
-            pending.computeIfAbsent(key, k -> new HashSet<>()).add(r.adId().intValue());
+            pending.computeIfAbsent(r.dimType() + ":" + r.dimValue(), k -> new HashSet<>())
+                    .add(r.adId().intValue());
             // 顺手统计每广告的定向条数，供 M5 兜底池排序
             adTargetCount.merge(r.adId(), 1, Integer::sum);
+            // M9：同时登记反向表。加载期单线程，add 后即可；
+            // 增量更新期（add/removeTargeting）会整体替换成新集合
+            adTargetKeys.computeIfAbsent(r.adId(), k -> ConcurrentHashMap.newKeySet())
+                    .add(key(r.dimType(), r.dimValue()));
         }
         return batch.size();
     }
@@ -183,7 +213,7 @@ public class InvertedIndex {
             int[] arr = set.stream().mapToInt(Integer::intValue).sorted().toArray();
             int split = key.indexOf(':');
             int dimType = Integer.parseInt(key.substring(0, split));
-            index.computeIfAbsent(dimType, k -> new HashMap<>())
+            index.computeIfAbsent(dimType, k -> new ConcurrentHashMap<>())
                     .put(key.substring(split + 1), arr);
         });
         int totalAds = pending.values().stream().mapToInt(Set::size).sum();
@@ -217,6 +247,193 @@ public class InvertedIndex {
         }
         int[] arr = dimMap.get(dimValue);
         return arr == null ? 0 : arr.length;
+    }
+
+    // =================================================================
+    // 增量更新 · M9
+    //
+    // 「改预算 / 改定向，保存即生效」这件事的全部难点都在这里。
+    //
+    // 【为什么不能只改数据库】
+    // M2 把广告详情与 596 万条定向全量缓存进了内存。改 MySQL 之后：
+    //   · 改预算 → adCache 里的 Ad.dailyBudget 还是旧值，
+    //     而 BidService 扣费用的是缓存对象的字段，界面改了库却没改行为；
+    //   · 改定向 → 倒排表里那条广告还在，下次竞价照样命中。
+    // 这就是典型的「缓存一致性」问题。真实系统里的选择有三条：
+    //   1. 全量重建索引（M2 实测要几十秒，演示时不可接受）
+    //   2. 写时复制整个索引（内存翻倍，且此刻所有请求都得等）
+    //   3. 增量修改本条广告涉及的少量 key（本项目选这条）
+    //
+    // 【第三条为什么便宜】
+    // 一条广告平均 10 个定向项，只影响 10 个 key。
+    // 每个 key 的数组平均 315 条（地域维度最坏 7,900），
+    // 增量改一次就是重排一个几百元素的数组——微秒级。
+    // 换来的性质是「改完立刻生效，不用重启，也不用等重建」。
+    //
+    // 【不做什么】
+    // 不做数据库与内存的双写补偿、不做变更日志。
+    // 因为本项目的写入方只有演示后台，量级是分钟级几次，
+    // 上「binlog 订阅 + 补偿」属于过度设计。
+    // 真实系统里这一层是必须的，面试时要主动说清这个前提。
+    // =================================================================
+
+    /**
+     * 替换广告详情缓存，使改预算 / 改出价立刻生效。
+     *
+     * <p><b>用 replaceAd 而不是 put</b>：Ad 对象是 Lombok @Data 生成的，
+     * 直接 put 一个改了字段的旧对象，JVM 里可能还有别的线程持有引用。
+     * 整体替换比原地改字段更安全，也更容易推理。
+     */
+    public void replaceAd(Ad ad) {
+        if (ad == null || ad.getId() == null) {
+            return;
+        }
+        if (ad.getStatus() != null && ad.getStatus() != 1) {
+            // 暂停/已耗尽的广告不参与竞价，缓存它就是浪费内存
+            adCache.remove(ad.getId());
+        } else {
+            adCache.put(ad.getId(), ad);
+        }
+    }
+
+    /** 从缓存取广告详情，供管理端回显 */
+    public Ad cachedAd(Long adId) {
+        return adCache.get(adId);
+    }
+
+    /**
+     * 给某条广告<b>新增</b>一条定向条件。
+     *
+     * <p>幂等：已存在时直接返回 false，不重复插入。
+     * 演示时后台可能重复点「保存」，插入侧必须能扛住。
+     */
+    public boolean addTargeting(Long adId, int dimType, String dimValue) {
+        int id = adId.intValue();
+        Map<String, int[]> dimMap = index.computeIfAbsent(dimType, k -> new ConcurrentHashMap<>());
+        int[] cur = dimMap.get(dimValue);
+        if (cur != null && Arrays.binarySearch(cur, id) >= 0) {
+            return false;
+        }
+        int[] next;
+        if (cur == null) {
+            next = new int[]{id};
+        } else {
+            int pos = Arrays.binarySearch(cur, id);
+            if (pos >= 0) {
+                return false;
+            }
+            int insertAt = -(pos + 1);
+            next = new int[cur.length + 1];
+            System.arraycopy(cur, 0, next, 0, insertAt);
+            next[insertAt] = id;
+            System.arraycopy(cur, insertAt, next, insertAt + 1, cur.length - insertAt);
+        }
+        // 【为什么可以安全地整体替换数组】
+        // 竞价线程读的是 dimMap.get() 拿到的引用，替换引用不影响它继续用旧数组。
+        // int[] 内部不会被就地修改，所以「读旧数组」永远是读到一个自洽的快照。
+        // 这比给索引加读写锁便宜得多——锁会让每次竞价都可能被后台写入阻塞。
+        dimMap.put(dimValue, next);
+        adTargetCount.merge(adId, 1, Integer::sum);
+        adTargetKeys.computeIfAbsent(adId, k -> ConcurrentHashMap.newKeySet())
+                .add(key(dimType, dimValue));
+        return true;
+    }
+
+    /**
+     * 移除某条广告的一条定向条件。
+     *
+     * <p>返回被移除前该 key 下的广告数，供管理端展示。
+     */
+    public int removeTargeting(Long adId, int dimType, String dimValue) {
+        Map<String, int[]> dimMap = index.get(dimType);
+        if (dimMap == null) {
+            return 0;
+        }
+        int[] cur = dimMap.get(dimValue);
+        if (cur == null) {
+            return 0;
+        }
+        int id = adId.intValue();
+        int pos = Arrays.binarySearch(cur, id);
+        if (pos < 0) {
+            return cur.length;
+        }
+        int[] next = new int[cur.length - 1];
+        System.arraycopy(cur, 0, next, 0, pos);
+        System.arraycopy(cur, pos + 1, next, pos, cur.length - pos - 1);
+        if (next.length == 0) {
+            // 整个 key 空了：删掉，否则会留下一个永远命中不到广告的死 key
+            dimMap.remove(dimValue);
+        } else {
+            dimMap.put(dimValue, next);
+        }
+        adTargetCount.computeIfPresent(adId, (k, v) -> v <= 1 ? null : v - 1);
+        adTargetKeys.computeIfPresent(adId, (k, set) -> {
+            set.remove(key(dimType, dimValue));
+            return set.isEmpty() ? null : set;
+        });
+        return cur.length;
+    }
+
+    /**
+     * 用数据库里的真实定向全量替换该广告的定向条件。
+     *
+     * <p>后台「保存定向」走这条而不是 add/remove 组合：
+     * 先读库里现状，算出与内存索引的差集，只改动真正变化的部分。
+     *
+     * <p><b>靠 {@code adTargetKeys} 这张反向表算差集</b>。
+     * 没有它就只能「把这个广告可能命中的所有 key 都找一遍」，
+     * 而 key 总数 4,844、且无法反查某条广告落在哪些 key 上——
+     * 为了改 1 条定向去遍历全部 key 属于用错工具。
+     *
+     * <p><b>分隔符用空格而不是冒号</b>：定向值本身可能含冒号
+     * （造数里的兴趣标签是中文，不含；但维度键一旦扩展就难说），
+     * 空格的歧义风险更低，且 {@code indexOf(' ')} 只查第一个，
+     * 不会出现「值里有分隔符」导致的错解析。
+     *
+     * @param current 库里现有的定向项
+     * @return 变更摘要，供接口回显，也让演示能说出「改了几条」
+     */
+    public Map<String, Object> syncTargeting(Long adId, List<TargetRow> current) {
+        Set<String> want = new HashSet<>();
+        for (TargetRow r : current) {
+            want.add(key(r.dimType(), r.dimValue()));
+        }
+        Set<String> have = adTargetKeys.getOrDefault(adId, Set.of());
+
+        int added = 0;
+        for (String k : want) {
+            if (!have.contains(k)) {
+                int sp = k.indexOf(' ');
+                if (addTargeting(adId, Integer.parseInt(k.substring(0, sp)), k.substring(sp + 1))) {
+                    added++;
+                }
+            }
+        }
+        int removed = 0;
+        for (String k : have) {
+            if (!want.contains(k)) {
+                int sp = k.indexOf(' ');
+                removeTargeting(adId, Integer.parseInt(k.substring(0, sp)), k.substring(sp + 1));
+                removed++;
+            }
+        }
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("want", want.size());
+        out.put("had", have.size());
+        out.put("added", added);
+        out.put("removed", removed);
+        out.put("effective", added + removed);
+        return out;
+    }
+
+    /** 某条广告当前的定向项集合（形如 "1 2301"），供管理端回显 */
+    public Set<String> targetingKeysOf(Long adId) {
+        return adTargetKeys.getOrDefault(adId, Set.of());
+    }
+
+    private static String key(int dimType, String dimValue) {
+        return dimType + " " + dimValue;
     }
 
     /**

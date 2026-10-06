@@ -97,4 +97,87 @@ public interface AdMapper {
      * 按主键查单条广告，用于兜底时取详情。
      */
     Ad findById(@Param("id") Long id);
+
+    // =================================================================
+    // 写入侧 · M9
+    //
+    // 存在的唯一理由是「改预算 / 改定向，保存即生效」。
+    // 这里只负责改数据库，内存索引的同步由 {@code AdAdminController}
+    // 调 {@code InvertedIndex} 的增量方法完成——
+    //
+    // 【为什么不把两件事塞进一个 Service】
+    // 因为它们的失败语义不同：数据库写成功而内存更新失败，
+    // 系统会进入「库里是新的、内存是旧的」的不一致状态。
+    // 拆开后调用方能明确决定「先改库还是先改内存」，
+    // 也更容易在演示时观察出问题出在哪一侧。
+    // =================================================================
+
+    /**
+     * 改日预算（可同时改出价与在投状态）。
+     *
+     * <p><b>刻意用一条 UPDATE 而不是一个通用 SET 拼接</b>：
+     * 通用 SET 拼接要防 SQL 注入，而这里所有可改字段都是数值或固定枚举，
+     * 用显式参数绑定既安全又能让 MySQL 用上 {@code updated_at} 的自动更新。
+     *
+     * <p>出价单独给了 setter：出价影响二价结算结果，
+     * 演示「改出价 → 扣费金额变化」时需要能单独改。
+     */
+    int updateBudget(@Param("id") Long id,
+                     @Param("dailyBudget") java.math.BigDecimal dailyBudget);
+
+    int updateBid(@Param("id") Long id, @Param("bid") java.math.BigDecimal bid);
+
+    /** 改状态：1 在投 / 2 暂停 / 3 已耗尽 */
+    int updateStatus(@Param("id") Long id, @Param("status") Integer status);
+
+    /**
+     * 读一条广告的全部定向项，供「保存定向」算差集。
+     *
+     * <p>返回 {@link com.rtb.index.InvertedIndex.TargetRow} 而不是新造 DTO：
+     * 同一份结构索引加载时就在用，少一个类型就少一处可能写错的地方。
+     */
+    java.util.List<com.rtb.index.InvertedIndex.TargetRow> listTargetingOf(@Param("adId") Long adId);
+
+    /**
+     * 删掉某条广告的<b>一条</b>定向条件。
+     *
+     * <p>刻意不做「按 ad_id 全删」：596 万行的表上那个写法走全表扫，
+     * 实测直接撞 5 秒超时。带上 dim_type + dim_value 后
+     * 走 {@code idx_dim_lookup} 的 range 扫描，{@code rows=1}。
+     * 详见 {@code AdMapper.xml} 里 {@code deleteTargetingOne} 的注释。
+     */
+    int deleteTargetingOne(@Param("adId") Long adId,
+                           @Param("dimType") Integer dimType,
+                           @Param("dimValue") String dimValue);
+
+    /**
+     * 清空某条广告的全部定向（兜底路径，低频）。
+     *
+     * <p>会扫全表，因此 SQL 上单独放宽了超时。
+     * 正常保存流程走「先读现状 → 逐条对比 → 只删要删的」，
+     * 不会用到这条。
+     */
+    int deleteTargetingOf(@Param("adId") Long adId);
+
+    int insertTargeting(@Param("adId") Long adId,
+                        @Param("dimType") Integer dimType,
+                        @Param("dimValue") String dimValue);
+
+    /**
+     * 恢复一条广告的日预算到指定值（演示重置用）。
+     *
+     * <p>与 {@link #updateBudget} 分开是因为语义不同：
+     * 这个会顺带把 status 从「已耗尽」改回「在投」，
+     * 而前者不会——广告主主动调预算和运维重置演示数据不是一回事。
+     */
+    int resetBudgetForDemo(@Param("id") Long id,
+                           @Param("dailyBudget") java.math.BigDecimal dailyBudget);
+
+    /**
+     * 管理端列表：按出价倒序取前 N 条在投广告。
+     *
+     * <p>刻意<b>不用分页</b>：管理端只给演示看，出价最高的 50 条就够了，
+     * 而且按出价排序天然把「值得演示的广告」排在前面。
+     */
+    java.util.List<Ad> listTopByBid(@Param("limit") int limit);
 }

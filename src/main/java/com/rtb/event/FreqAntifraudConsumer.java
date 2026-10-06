@@ -60,6 +60,16 @@ public class FreqAntifraudConsumer {
     /** 待刷盘的小时打点批次 */
     private final List<FreqRecord> pending = new ArrayList<>();
 
+    /**
+     * 业务暂停开关 · M9
+     *
+     * <p>与 {@link HourlyPreaggConsumer#paused} 同一个取舍：
+     * 暂停时仍然 ack，让 lag 保持为 0。
+     * 演示要展示的是「下游产出停住」而不是「lag 曲线爬升」——
+     * 前者能证明解耦，后者会让人误以为消息丢了。
+     */
+    private volatile boolean paused = false;
+
     public FreqAntifraudConsumer(EventCodec codec,
                                  FreqAntifraudMapper mapper,
                                  ConsumerAuditMapper audit,
@@ -81,6 +91,16 @@ public class FreqAntifraudConsumer {
         long t0 = System.nanoTime();
         String eventId = "unknown";
         try {
+            // 【为什么暂停时也要 ack】
+            // 与预聚合消费组同一个取舍：不 ack 的话消息会被重新投递，
+            // 恢复后要处理一大段重复消息，位点也会长期降不下去。
+            // 这里 ack 掉并丢弃处理，语义是「这一批不要了」，
+            // 演示要的正是这个效果——下游产出停住，而 lag 保持干净。
+            if (paused) {
+                ack.acknowledge();
+                return;
+            }
+
             BidEvent e = codec.decode(payload);
             eventId = e.getEventId();
 
@@ -179,6 +199,15 @@ public class FreqAntifraudConsumer {
 
     public int getPendingSize() {
         return pending.size();
+    }
+
+    /** 业务暂停开关 · M9，供 {@code /admin/consumer/freq-antifraud} 使用 */
+    public void setPaused(boolean p) {
+        this.paused = p;
+    }
+
+    public boolean isPaused() {
+        return paused;
     }
 
     private static class FreqRecord {

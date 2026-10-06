@@ -69,7 +69,22 @@ CREATE TABLE ad_target (
   dim_type  TINYINT         NOT NULL COMMENT '1地域 2年龄段 3性别 4兴趣 5系统 6设备',
   dim_value VARCHAR(64)     NOT NULL COMMENT '定向值，如 110000 / 25-30 / male / 数码科技',
   PRIMARY KEY (id),
-  KEY idx_dim_lookup (dim_type, dim_value, ad_id)
+  KEY idx_dim_lookup (dim_type, dim_value, ad_id),
+  -- M9 新增。业务语义上「一条广告在同一维度上的同一个取值」只能有一条。
+  --
+  -- 【不加会怎样：实测踩过】
+  -- 写 m9_demo_ad_fix.sql 时用了普通 INSERT，脚本重跑一次就多一份重复定向，
+  -- 连跑三次后同一条 (ad_id,dim_type,dim_value) 变成 3 行——
+  -- 而 INSERT 不报错、页面也不报错，只是数据静默变脏。
+  --
+  -- 后果不只是「数据不好看」：倒排求交时同一条广告会被计入多次，
+  -- 候选集虚高，而 bid_log 里的 candidate_cnt 也会跟着失真。
+  -- 演示第 3 步要讲的「候选 128 条」就不再可信了。
+  --
+  -- 代价：50 万广告 × 10 项 = 596 万行多维护一个唯一索引。
+  -- 评估过是可接受的——本表只在造数与演示管理端写入（低频），
+  -- 不在竞价热路径上，索引维护成本不落在 P99 上。
+  UNIQUE KEY uk_ad_dim (ad_id, dim_type, dim_value)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='定向条件倒排';
 
 -- ---------------------------------------------------------------------

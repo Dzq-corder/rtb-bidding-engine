@@ -128,4 +128,111 @@
     WHERE id = #{id}
   </select>
 
+  <!--
+    写入侧 · M9
+    ==============================================
+    全部走显式参数绑定，不做字符串拼接。
+    改完数据库后由 AdAdminController 调 InvertedIndex 的增量方法同步内存，
+    两步都成功才算「保存即生效」。
+  -->
+
+  <update id="updateBudget">
+    UPDATE ad SET daily_budget = #{dailyBudget} WHERE id = #{id}
+  </update>
+
+  <update id="updateBid">
+    UPDATE ad SET bid = #{bid} WHERE id = #{id}
+  </update>
+
+  <update id="updateStatus">
+    UPDATE ad SET status = #{status} WHERE id = #{id}
+  </update>
+
+  <!--
+    读一条广告的定向项，供保存时算差集。
+    ORDER BY id 保证顺序稳定：差集计算虽然用 Set，但稳定顺序让
+    接口返回的 want 列表看起来是确定的，便于演示时对照。
+  -->
+  <select id="listTargetingOf" resultType="com.rtb.index.InvertedIndex$TargetRow">
+    SELECT id, dim_type AS dimType, dim_value AS dimValue, ad_id AS adId
+    FROM ad_target
+    WHERE ad_id = #{adId}
+    ORDER BY dim_type, dim_value
+  </select>
+
+  <!--
+    按「维度 + 取值」删，而不是只按 ad_id 删。
+
+    ⚠️ 【实测踩到的坑：只按 ad_id 删会超时】
+    第一版写的是 DELETE FROM ad_target WHERE ad_id = ?，
+    在 596 万行的表上 EXPLAIN 是：
+        type: ALL    key: NULL    rows: 5955971
+    ——全表扫 596 万行去删 5 行，直接撞上
+    mybatis.default-statement-timeout=5s 报 MySQLTimeoutException。
+    演示时这个接口 100% 失败，而且报错信息指向「超时」，
+    很容易误以为是数据库负载问题。
+
+    加上 dim_type + dim_value 后走 idx_dim_lookup（现有索引）：
+        type: range  key: idx_dim_lookup  rows: 1
+    代价是零——不用为管理端新增任何索引，
+    而 idx_dim_lookup 本来就是 M1 为定向检索建的那个。
+
+    【教训】
+    「没有可用索引」和「索引列序不对」是两个不同的问题。
+    这次不是缺索引，而是查询条件没覆盖到已有索引的前导列。
+    先看 EXPLAIN 再决定加不加索引，比直接加一个省事得多。
+  -->
+  <delete id="deleteTargetingOne">
+    DELETE FROM ad_target
+    WHERE ad_id = #{adId} AND dim_type = #{dimType} AND dim_value = #{dimValue}
+  </delete>
+
+  <!--
+    兜底：只按 ad_id 删时使用，需显式放宽超时。
+    保留它是因为「清空某广告全部定向」是语义上必要的操作，
+    而逐条删虽然快但调用方要多传一组参数。
+
+    timeout=30000 是给这类管理端低频操作开的口子，
+    业务链路（竞价、扣费、落库）一个字都不放宽——
+    那是 M5 熔断要守住的 100ms 预算。
+  -->
+  <delete id="deleteTargetingOf" timeout="30000">
+    DELETE FROM ad_target WHERE ad_id = #{adId}
+  </delete>
+
+  <insert id="insertTargeting">
+    INSERT INTO ad_target (ad_id, dim_type, dim_value) VALUES (#{adId}, #{dimType}, #{dimValue})
+  </insert>
+
+  <!--
+    演示重置：预算改回给定值，并把 status 从「已耗尽」拉回「在投」。
+
+    为什么要顺带改 status：
+    演示第 5 步会把 A 的预算耗尽，此时若仅改预算而不改 status，
+    引擎仍会因为「已耗尽」而不让它参竞——现场看到这个现象会以为功能坏了。
+    真实系统里广告主重新充值后也是这样自动恢复的。
+  -->
+  <update id="resetBudgetForDemo">
+    UPDATE ad
+    SET daily_budget = #{dailyBudget},
+        status = CASE WHEN status = 3 THEN 1 ELSE status END
+    WHERE id = #{id}
+  </update>
+
+  <!--
+    管理端列表：按出价倒序。
+    ad 表只有 PRIMARY KEY(id)，按 bid 排序走全表扫 + filesort——
+    这里刻意不建索引：50 万行取前 50 条，
+    加 (bid) 索引要付 50 万行的写入维护成本，而管理端一天点几十次。
+    这是「读多写少的低频查询不值得建索引」的典型例子。
+  -->
+  <select id="listTopByBid" resultType="com.rtb.ad.Ad">
+    SELECT id, advertiser_id, title, creative_url, category_code,
+           bid, daily_budget, status, created_at, updated_at
+    FROM ad
+    WHERE status = 1
+    ORDER BY bid DESC
+    LIMIT #{limit}
+  </select>
+
 </mapper>
