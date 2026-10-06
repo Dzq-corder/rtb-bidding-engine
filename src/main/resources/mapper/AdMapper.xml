@@ -36,6 +36,7 @@
     <if test="categoryCode != null">
       AND a.category_code = #{categoryCode}
     </if>
+    ORDER BY a.bid DESC
   </select>
 
   <select id="countActive" resultType="long">

@@ -9,7 +9,6 @@ import org.springframework.stereotype.Service;
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
@@ -26,7 +25,7 @@ import java.util.concurrent.ThreadLocalRandom;
  *   <li><b>无定向匹配能力</b>。地域/年龄/性别/兴趣的匹配本身就是 M2 的交付物
  *       （倒排多条件求交），M1 不做。这不属于「砍业务逻辑」——
  *       倒排是<b>替代方案</b>，不是业务规则本身</li>
- *   <li>出价排序在应用层做，没走数据库 ORDER BY</li>
+ *   <li>出价排序已下推到 SQL（findCandidates 末尾 {@code ORDER BY a.bid DESC}），应用层不再排序</li>
  *   <li><b>一价</b>：按最高出价扣费。二价是 M4 的交付物</li>
  *   <li>预算扣减是「读余额 → 校验 → 扣减」三步，非原子。M3 改Lua</li>
  *   <li>日志<b>同步逐条 INSERT</b>。M7 改有界队列 + 批量刷盘</li>
@@ -91,12 +90,11 @@ public class BidService {
         int filterCost = ms(tFilter, tFilterEnd);
 
         // ---------------------------------------------------------
-        // ③ 出价排序：应用层排序
+        // ③ 出价排序：已下推到 SQL（findCandidates 末尾 ORDER BY a.bid DESC）
+        //    应用层不再二次排序，matched 顺序即 DB 返回顺序（出价降序），
+        //    fall-through 扣预算时保证从最高出价往下找。
         // ---------------------------------------------------------
-        long tSort = System.nanoTime();
-        matched.sort(Comparator.comparing(Ad::getBid).reversed());
-        long tSortEnd = System.nanoTime();
-        int sortCost = ms(tSort, tSortEnd);
+        int sortCost = 0;
 
         // ---------------------------------------------------------
         // ④ 计费：一价，按最高出价扣
@@ -107,15 +105,22 @@ public class BidService {
         Integer advertiserId = null;
         Long adId = null;
 
+        // 一价竞价 + fall-through：沿排序后的候选列表（按出价降序）依次尝试扣预算，
+        // 命中第一个预算充足的广告即成交。第一名预算耗尽不再"直接空"，
+        // 而是继续往后找——真实竞价应"尽力成交"。
+        // 失败的 deduct 不会改写余额（校验不通过即返回 false，无 decrement），
+        // 因此多试几个候选是安全的。
         if (!matched.isEmpty()) {
-            Ad top = matched.get(0);
-            // 一价：出多少扣多少
-            boolean deducted = budgetService.deduct(top.getId(), top.getDailyBudget(), top.getBid());
-            if (deducted) {
-                winner = top;
-                payPrice = top.getBid();
-                advertiserId = top.getAdvertiserId();
-                adId = top.getId();
+            for (Ad candidate : matched) {
+                // 一价：出多少扣多少
+                boolean deducted = budgetService.deduct(candidate.getId(), candidate.getDailyBudget(), candidate.getBid());
+                if (deducted) {
+                    winner = candidate;
+                    payPrice = candidate.getBid();
+                    advertiserId = candidate.getAdvertiserId();
+                    adId = candidate.getId();
+                    break;
+                }
             }
         }
         long tBillEnd = System.nanoTime();
@@ -153,7 +158,8 @@ public class BidService {
             entity.setRegion(req.getRegion());
             entity.setAge(req.getAge());
             entity.setGender(req.getGender());
-            entity.setInterests(req.getInterests());
+            // interests 在请求里可选；为 null 时落空串，命中 schema 的 DEFAULT '' 语义，避免 NOT NULL 报错
+            entity.setInterests(req.getInterests() != null ? req.getInterests() : "");
             entity.setCandidateCnt(candidateCnt);
             entity.setMatchCnt(matchCnt);
             entity.setHasAd(winner != null ? 1 : 0);

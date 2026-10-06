@@ -43,6 +43,9 @@ public class BidController {
 
     @PostConstruct
     void loadTargetingValues() {
+        // [已禁用] M1 阶段不再需要启动时预载定向词表（/bid/batch 的 randomRequest 暂不使用）。
+        // 如需恢复，取消下方注释即可重新执行两条预载 SQL：
+        /*
         try {
             Map<String, List<String>> pool = new HashMap<>();
             for (Map<String, Object> row : adMapper.listTargetingValues(List.of(DIM_REGION, DIM_INTEREST))) {
@@ -70,6 +73,7 @@ public class BidController {
         } catch (Exception e) {
             log.warn("加载定向取值失败，压测将使用兜底词表：{}", e.getMessage());
         }
+        */
     }
 
     /**
