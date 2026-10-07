@@ -117,6 +117,10 @@ rtb:
   fallback:
     # 强制兜底开关：true 时所有请求直接返回兜底广告，用于复现「依赖全面故障」
     force: false
+  detail:
+    # M7 测量专用：true 时退化成同步单条 INSERT（模拟 M1 基线写入路径），
+    # 用于产出「写吞吐由 A 提升至 B」的 A 值。正常压测与演示必须保持 false。
+    sync-insert: false
   kafka:
     topic: bid_event
     partitions: 3

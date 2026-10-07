@@ -4,6 +4,7 @@ import com.rtb.bid.BidLog;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.DisposableBean;
 import org.springframework.beans.factory.InitializingBean;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Component;
 
@@ -43,6 +44,15 @@ public class BidDetailBuffer implements InitializingBean, DisposableBean {
     private static final long FLUSH_MS = 200;
 
     private final JdbcTemplate jdbc;
+
+    /**
+     * 测量专用开关（默认 false）。置 true 时 enqueue 退化为「同步单条 INSERT」，
+     * 模拟 M1 基线的写入路径，用于产出 M7「写吞吐由 A 提升至 B」的 A 值。
+     * 正常压测与演示必须保持 false（走队列 + 后台批量刷盘）。
+     */
+    @Value("${rtb.detail.sync-insert:false}")
+    private boolean syncInsert;
+
     private final ArrayBlockingQueue<BidLog> queue = new ArrayBlockingQueue<>(QUEUE_CAP);
     private final Thread flusher;
 
@@ -79,8 +89,18 @@ public class BidDetailBuffer implements InitializingBean, DisposableBean {
 
     /**
      * 主链路调用：入队一条竞价明细。队列满则丢弃（可采样），恒不阻塞主链路。
+     * 当 {@code syncInsert=true}（仅测量用）退化为同步单条 INSERT，模拟 M1 基线写入路径。
      */
     public void enqueue(BidLog detail) {
+        if (syncInsert) {
+            // 测量专用：单条同步落库，写入延迟直接计入主链路（即 M1 基线行为，作「优化前 A」）
+            try {
+                jdbc.update(SQL, (Object[]) toParams(detail));
+            } catch (Exception e) {
+                log.warn("sync-insert 单条落 bid_log 失败（忽略）: {}", e.getMessage());
+            }
+            return;
+        }
         if (!queue.offer(detail)) {
             long d = dropped.incrementAndGet();
             if (d % 1000 == 1) {
@@ -137,14 +157,7 @@ public class BidDetailBuffer implements InitializingBean, DisposableBean {
         int n = batch.size();
         List<Object[]> params = new ArrayList<>(n);
         for (BidLog l : batch) {
-            params.add(new Object[]{
-                    l.getRequestId(), l.getAdId(), l.getAdvertiserId(), l.getSlotCode(),
-                    l.getRegion(), l.getAge(), l.getGender(), l.getInterests(),
-                    l.getCandidateCnt(), l.getMatchCnt(), l.getHasAd(),
-                    l.getWinBid(), l.getPayPrice(),
-                    l.getCostMs(), l.getCandidateCost(), l.getFilterCost(), l.getSortCost(), l.getBillCost(),
-                    l.getBidAt()
-            });
+            params.add(toParams(l));
         }
         try {
             jdbc.batchUpdate(SQL, params);
@@ -153,5 +166,17 @@ public class BidDetailBuffer implements InitializingBean, DisposableBean {
             // 落库失败：丢弃本批（明细可丢），记录但不影响主链路
             log.error("批量落 bid_log 失败（丢弃本批 {} 条）: {}", n, e.getMessage());
         }
+    }
+
+    /** 单条明细 → INSERT 参数数组（同步单条与批量刷盘共用） */
+    private Object[] toParams(BidLog l) {
+        return new Object[]{
+                l.getRequestId(), l.getAdId(), l.getAdvertiserId(), l.getSlotCode(),
+                l.getRegion(), l.getAge(), l.getGender(), l.getInterests(),
+                l.getCandidateCnt(), l.getMatchCnt(), l.getHasAd(),
+                l.getWinBid(), l.getPayPrice(),
+                l.getCostMs(), l.getCandidateCost(), l.getFilterCost(), l.getSortCost(), l.getBillCost(),
+                l.getBidAt()
+        };
     }
 }

@@ -53,6 +53,11 @@ def main():
         cur.execute("SELECT COALESCE(SUM(pay_price),0) FROM billing_event")
         bill_pay_sum = float(cur.fetchone()[0])
 
+        # 写吞吐：以 bid_at 跨度估算明细落库速率（行/秒）
+        cur.execute("SELECT TIMESTAMPDIFF(SECOND, MIN(bid_at), MAX(bid_at)) FROM bid_log")
+        span = cur.fetchone()[0] or 0
+        throughput = (bid_log_rows / span) if span > 0 else 0.0
+
         # 队列丢弃计数（仅存在于应用内存，重启即清零；此处读不到，需看应用日志 grep "bid_log 队列已满"）
         cur.close()
         conn.close()
@@ -73,6 +78,7 @@ def main():
     print(f"avg cost_ms / cand / bill   = {avg_cost:.1f} / {avg_cand:.1f} / {avg_bill:.1f} ms")
     print(f"bid_log 实扣总额            = {log_pay_sum:.4f}")
     print(f"billing_event 实扣总额      = {bill_pay_sum:.4f}")
+    print(f"落库时间跨度 / 写吞吐      = {span}s / {throughput:.1f} 条/秒")
     print("-" * 56)
 
     gap = bid_log_rows - billing_rows
