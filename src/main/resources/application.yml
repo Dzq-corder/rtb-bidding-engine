@@ -47,6 +47,9 @@ spring:
       # M6 启用。acks=all 配合幂等生产者，防止事件丢失与重复
       acks: all
       retries: 3
+      # 显式指定 String 序列化（key=adId 分区键，value=事件 JSON）
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
       properties:
         enable.idempotence: true
         linger.ms: 5
@@ -56,6 +59,8 @@ spring:
       auto-offset-reset: latest
       enable-auto-commit: false
       # 消费端手动提交位点，保证至少一次投递
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       max-poll-records: 500
     listener:
       # 手动提交，配合幂等实现「至少一次 + 最终只生效一次」

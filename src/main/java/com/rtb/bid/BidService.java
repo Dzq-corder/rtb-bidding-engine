@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.rtb.ad.Ad;
 import com.rtb.ad.AdMapper;
 import com.rtb.budget.BudgetService;
+import com.rtb.counter.BidEvent;
+import com.rtb.counter.BidEventPublisher;
 import com.rtb.resilience.CircuitBreaker;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -23,7 +25,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.function.Supplier;
 
 /**
- * 竞价主链路 · M1 朴素实现 + M3 预算 Lua + M4 二价 + M5 超时/熔断/兜底
+ * 竞价主链路 · M1 朴素实现 + M3 预算 Lua + M4 二价 + M5 超时/熔断/兜底 + M6 事件旁路
  *
  * <p>链路：候选检索 → 定向过滤（已下推 SQL）→ 二价计费（fall-through）→ 返回。
  *
@@ -37,6 +39,10 @@ import java.util.function.Supplier;
  *       兜底广告（代码静态常量作最后保底），<b>绝不返回空广告、绝不请求失败</b>。</li>
  * </ul>
  *
+ * <p><b>M6（事件旁路）</b>：每次 {@code /bid} 在 return 之前都会通过 {@link BidEventPublisher}
+ * 异步投递一条 {@link BidEvent} 到 Kafka（分区键=adId），由三个独立消费组异步落库。
+ * 发送是 fire-and-forget 且包在 try-catch 中，<b>绝不增加延迟、绝不因 Kafka 故障影响主链路</b>。
+ *
  * <p>注意：M1<b>没有</b>本地缓存、<b>没有</b>走 MQ（同步链路刻意不进 MQ）。
  * 统计代码已注释（2026-10-06），/bid 只做纯服务化链路。
  */
@@ -48,6 +54,7 @@ public class BidService {
     private final BudgetService budgetService;
     private final StringRedisTemplate redis;
     private final ObjectMapper objectMapper;
+    private final BidEventPublisher bidEventPublisher;
 
     /** 二价最小加价单位（元）。默认 1 分，可通过 rtb.min-increment 覆盖 */
     @Value("${rtb.min-increment:0.01}")
@@ -89,12 +96,14 @@ public class BidService {
                       BudgetService budgetService,
                       StringRedisTemplate redis,
                       ObjectMapper objectMapper,
+                      BidEventPublisher bidEventPublisher,
                       @Value("${rtb.circuit-breaker.failure-threshold:5}") int failureThreshold,
                       @Value("${rtb.circuit-breaker.cooldown-ms:5000}") long cooldownMs) {
         this.adMapper = adMapper;
         this.budgetService = budgetService;
         this.redis = redis;
         this.objectMapper = objectMapper;
+        this.bidEventPublisher = bidEventPublisher;
         this.dbBreaker = new CircuitBreaker(failureThreshold, cooldownMs);
         this.redisBreaker = new CircuitBreaker(failureThreshold, cooldownMs);
         seedFallbackAd();
@@ -102,6 +111,7 @@ public class BidService {
 
     /**
      * 执行一次竞价。M5 下任何「不该打 / 打失败 / 超时 / 预算耗尽」都统一收敛到兜底广告。
+     * M6 下每个出口在 return 前都会异步发布一条竞价事件（旁路，不影响返回）。
      */
     public BidRequest.Result bid(BidRequest req) {
         String requestId = UUID.randomUUID().toString().replace("-", "");
@@ -109,7 +119,9 @@ public class BidService {
 
         // 强制兜底（演示/复现开关）：直接返回兜底广告，模拟依赖全面故障
         if (forceFallback) {
-            return buildFallback(requestId);
+            BidRequest.Result r = buildFallback(requestId);
+            publishBidEvent(requestId, req.getRegion(), r);
+            return r;
         }
 
         // ---------------------------------------------------------
@@ -118,7 +130,9 @@ public class BidService {
         List<Ad> candidates = retrieveCandidates(req, deadline);
         if (candidates == null) {
             // 熔断 OPEN / 超时 / 异常 → 兜底，绝不返回空
-            return buildFallback(requestId);
+            BidRequest.Result r = buildFallback(requestId);
+            publishBidEvent(requestId, req.getRegion(), r);
+            return r;
         }
 
         // ---------------------------------------------------------
@@ -128,7 +142,9 @@ public class BidService {
 
         // 候选为空（检索无命中）→ 兜底，不返回空广告
         if (matched.isEmpty()) {
-            return buildFallback(requestId);
+            BidRequest.Result r = buildFallback(requestId);
+            publishBidEvent(requestId, req.getRegion(), r);
+            return r;
         }
 
         // ---------------------------------------------------------
@@ -177,7 +193,9 @@ public class BidService {
 
         // Redis 熔断 OPEN / 预算全部不足 / 整体超时 → 兜底广告保底
         if (winner == null) {
-            return buildFallback(requestId);
+            BidRequest.Result r = buildFallback(requestId);
+            publishBidEvent(requestId, req.getRegion(), r);
+            return r;
         }
 
         // [已注释] 分段计时埋点 + bid_log 落库（M1 baseline 压测期间不采集统计，纯服务化）
@@ -185,7 +203,34 @@ public class BidService {
         //         adId, advertiserId, winner, payPrice,
         //         costMs, candidateCost, filterCost, sortCost, billCost);
 
-        return buildResult(requestId, candidates, matched, winner, payPrice);
+        BidRequest.Result r = buildResult(requestId, candidates, matched, winner, payPrice);
+        publishBidEvent(requestId, req.getRegion(), r);
+        return r;
+    }
+
+    /**
+     * M6：构造并发布竞价事件（旁路）。无论胜出还是兜底，都发送一条事件供下游三消费组使用。
+     * 内部已 try-catch，任何异常都不影响主链路返回。
+     */
+    private void publishBidEvent(String requestId, String region, BidRequest.Result r) {
+        try {
+            BidEvent e = BidEvent.builder()
+                    .eventId(UUID.randomUUID().toString().replace("-", ""))
+                    .requestId(requestId)
+                    .ts(System.currentTimeMillis())
+                    .region(region)
+                    .adId(r.getWinner() != null ? r.getWinner().getAdId() : null)
+                    .advertiserId(r.getWinner() != null ? r.getWinner().getAdvertiserId() : null)
+                    .winBid(r.getWinner() != null ? r.getWinner().getBid() : null)
+                    .payPrice(r.getPayPrice())
+                    .fallback(Boolean.TRUE.equals(r.getFallback()))
+                    .hasAd(Boolean.TRUE.equals(r.getHasAd()))
+                    .priceMode(r.getPriceMode() == null ? 0 : r.getPriceMode())
+                    .build();
+            bidEventPublisher.publish(e);
+        } catch (Exception ex) {
+            log.warn("发布竞价事件失败（忽略，不影响竞价返回）requestId={}: {}", requestId, ex.getMessage());
+        }
     }
 
     /**
