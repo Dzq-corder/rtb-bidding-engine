@@ -4,6 +4,7 @@ import com.rtb.ad.Ad;
 import com.rtb.ad.AdMapper;
 import com.rtb.budget.BudgetService;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
@@ -22,7 +23,7 @@ import java.util.UUID;
  *       <b>不建索引</b>，因此全表扫描。M2 用倒排索引替代</li>
  *   <li><b>无定向匹配能力</b>。地域/年龄/性别/兴趣的匹配本身就是 M2 的交付物
  *       （倒排多条件求交），M1 不做。</li>
- *   <li>一价：按最高出价扣费。二价是 M4 的交付物</li>
+ *   <li>二价（次高出价 + 最小加价）：M4 已交付，priceMode=1，成交价由次高出价决定而非自身出价</li>
  *   <li>预算扣减是「读余额 → 校验 → 扣减」三步，非原子。M3 改Lua</li>
  * </ul>
  *
@@ -44,6 +45,10 @@ public class BidService {
         this.adMapper = adMapper;
         this.budgetService = budgetService;
     }
+
+    /** 二价最小加价单位（元）。默认 1 分，可通过 rtb.min-increment 覆盖 */
+    @Value("${rtb.min-increment:0.01}")
+    private BigDecimal minIncrement;
 
     /**
      * 执行一次竞价。
@@ -73,25 +78,32 @@ public class BidService {
         // ---------------------------------------------------------
 
         // ---------------------------------------------------------
-        // ④ 计费：一价，沿出价降序 fall-through 找第一个预算充足的广告成交
+        // ④ 计费：二价拍卖（Vickrey）+ fall-through
+        //    候选已按出价降序（SQL ORDER BY a.bid DESC）。
+        //    胜出者 = 沿降序第一个预算充足的候选（fall-through 尽力成交）；
+        //    成交价 = min(胜出者出价, 次高出价 + 最小加价)，绝不高于自身出价。
+        //    二价价值：广告主敢报真实价，成交价由市场(次高)决定而非自身出价。
         // ---------------------------------------------------------
         Ad winner = null;
         BigDecimal payPrice = null;
         Integer advertiserId = null;
         Long adId = null;
 
-        // 一价竞价 + fall-through：沿排序后的候选列表（按出价降序）依次尝试扣预算，
-        // 命中第一个预算充足的广告即成交。第一名预算耗尽不再"直接空"，
-        // 而是继续往后找——真实竞价应"尽力成交"。
-        // 失败的 deduct 不会改写余额（校验不通过即返回 false，无 decrement），
-        // 因此多试几个候选是安全的。
+        // fall-through + 二价：沿排序后的候选列表（按出价降序）依次尝试扣预算，
+        // 命中第一个预算充足的广告即成交（前几名预算耗尽则继续往后找，真实竞价"尽力成交"）。
+        // 失败的 deduct 不会改写余额（校验不通过即返回 false，无 decrement），多试安全。
         if (!matched.isEmpty()) {
-            for (Ad candidate : matched) {
-                // 一价：出多少扣多少
-                boolean deducted = budgetService.deduct(candidate.getId(), candidate.getDailyBudget(), candidate.getBid());
+            for (int i = 0; i < matched.size(); i++) {
+                Ad candidate = matched.get(i);
+                // 二价成交价：次高出价 + 最小加价，且不超过自身出价
+                BigDecimal secondBid = (i + 1 < matched.size())
+                        ? matched.get(i + 1).getBid()      // 下一名（次高）的出价
+                        : candidate.getBid();               // 仅一名候选，次高=自身
+                BigDecimal price = secondBid.add(minIncrement).min(candidate.getBid());
+                boolean deducted = budgetService.deduct(candidate.getId(), candidate.getDailyBudget(), price);
                 if (deducted) {
                     winner = candidate;
-                    payPrice = candidate.getBid();
+                    payPrice = price;
                     advertiserId = candidate.getAdvertiserId();
                     adId = candidate.getId();
                     break;
@@ -114,8 +126,9 @@ public class BidService {
         r.setHasAd(winner != null);
         r.setCandidateCnt(candidates.size());
         r.setMatchCnt(matched.size());
-        // 0 = 一价，M4 起为 1
-        r.setPriceMode(0);
+        // 1 = 二价（M4 引入：成交价=次高出价+最小加价，不超过自身出价）
+        r.setPriceMode(1);
+        r.setPayPrice(payPrice);
 
         if (winner != null) {
             BidRequest.AdInfo info = new BidRequest.AdInfo();

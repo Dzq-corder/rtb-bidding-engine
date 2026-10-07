@@ -53,6 +53,8 @@ public class BidRequest {
         private List<AdInfo> topCandidates;
         /** 计费方式：0 一价 1 二价 */
         private Integer priceMode;
+        /** 实际成交价（元）。二价下低于胜出者出价，演示时与 winner.bid 对照 */
+        private java.math.BigDecimal payPrice;
         private Cost cost;
     }
 
