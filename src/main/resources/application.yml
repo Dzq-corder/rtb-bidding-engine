@@ -95,8 +95,23 @@ logging:
     console: "%d{HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n"
 
 rtb:
-  # 竞价总超时预算（毫秒），M5 熔断以此为总闸
-  timeout-ms: 100
+  # ===== M5 超时与熔断配置 =====
+  # 整条链路总超时预算（ms）：SLA 闸门，超过即放弃后续步骤走兜底
+  timeout:
+    total-ms: 1000
+    # DB 候选检索子预算（ms）：当前 m1-explore 线 M2 未完成，检索为全表扫(~250ms)，
+    # 故设 800 留出余量让正常路径跑通；演示故障时可临时调小(如 10)触发超时兜底
+    db-ms: 800
+    # Redis 计费子预算（ms）
+    redis-ms: 200
+  circuit-breaker:
+    # 连续失败达到该值 → OPEN（后续请求短路兜底）
+    failure-threshold: 5
+    # OPEN 冷却时长（ms），到期后 HALF_OPEN 放一个探活，成功自愈
+    cooldown-ms: 5000
+  fallback:
+    # 强制兜底开关：true 时所有请求直接返回兜底广告，用于复现「依赖全面故障」
+    force: false
   kafka:
     topic: bid_event
     partitions: 3

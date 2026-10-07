@@ -43,6 +43,8 @@ public class BidRequest {
         private String requestId;
         /** 是否返回了广告 */
         private Boolean hasAd;
+        /** 是否为兜底广告（M5 引入）：true=依赖故障/超时/预算耗尽时返回的保底广告，不计费 */
+        private Boolean fallback;
         /** 胜出广告 */
         private AdInfo winner;
         /** 候选集大小，检索返回行数 */

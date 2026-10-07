@@ -1,37 +1,44 @@
 package com.rtb.bid;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.rtb.ad.Ad;
 import com.rtb.ad.AdMapper;
 import com.rtb.budget.BudgetService;
+import com.rtb.resilience.CircuitBreaker;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.function.Supplier;
 
 /**
- * 竞价主链路 · M1 朴素实现
+ * 竞价主链路 · M1 朴素实现 + M3 预算 Lua + M4 二价 + M5 超时/熔断/兜底
  *
- * <p>链路：候选检索 → 定向过滤 → 计费 → 返回
+ * <p>链路：候选检索 → 定向过滤（已下推 SQL）→ 二价计费（fall-through）→ 返回。
  *
- * <p><b>本轮刻意保留的「未优化」特征</b>（它们是 M2~M7 的靶子）：
+ * <p><b>本轮（M5）新增的韧性机制</b>：
  * <ul>
- *   <li>候选检索走 {@code WHERE status=1 AND category_code=?}，
- *       <b>不建索引</b>，因此全表扫描。M2 用倒排索引替代</li>
- *   <li><b>无定向匹配能力</b>。地域/年龄/性别/兴趣的匹配本身就是 M2 的交付物
- *       （倒排多条件求交），M1 不做。</li>
- *   <li>二价（次高出价 + 最小加价）：M4 已交付，priceMode=1，成交价由次高出价决定而非自身出价</li>
- *   <li>预算扣减是「读余额 → 校验 → 扣减」三步，非原子。M3 改Lua</li>
+ *   <li><b>超时预算</b>：入链定 {@code deadline = now + total-ms}，各跳受子预算约束，
+ *       超期即放弃后续步骤、直接兜底，保证整条链路不越过 SLA。</li>
+ *   <li><b>熔断</b>：DB 检索与 Redis 计费各持独立熔断器；
+ *       连续失败超阈值 → OPEN（后续请求短路兜底），冷却后 HALF_OPEN 放一个探活，成功自愈。</li>
+ *   <li><b>兜底广告</b>：任何失败（超时 / 熔断 OPEN / 候选为空 / 预算耗尽）一律返回 Redis 中的
+ *       兜底广告（代码静态常量作最后保底），<b>绝不返回空广告、绝不请求失败</b>。</li>
  * </ul>
  *
- * <p>注意：M1<b>没有</b>超时熔断、<b>没有</b>本地缓存、<b>没有</b>走MQ。
- *
- * <p><b>统计代码已注释（2026-10-06）</b>：分段耗时埋点（candidateCost 等）
- * 与 bid_log 落库（persistLog）在本阶段全部禁用，/bid 只做纯服务化链路，
- * 压测数字不被落库与计时拖慢。恢复时取消对应注释即可。
+ * <p>注意：M1<b>没有</b>本地缓存、<b>没有</b>走 MQ（同步链路刻意不进 MQ）。
+ * 统计代码已注释（2026-10-06），/bid 只做纯服务化链路。
  */
 @Slf4j
 @Service
@@ -39,76 +46,138 @@ public class BidService {
 
     private final AdMapper adMapper;
     private final BudgetService budgetService;
-
-    public BidService(AdMapper adMapper,
-                      BudgetService budgetService) {
-        this.adMapper = adMapper;
-        this.budgetService = budgetService;
-    }
+    private final StringRedisTemplate redis;
+    private final ObjectMapper objectMapper;
 
     /** 二价最小加价单位（元）。默认 1 分，可通过 rtb.min-increment 覆盖 */
     @Value("${rtb.min-increment:0.01}")
     private BigDecimal minIncrement;
 
+    /** M5：整条链路总超时预算（ms），SLA 闸门 */
+    @Value("${rtb.timeout.total-ms:1000}")
+    private long totalTimeoutMs;
+
+    /** M5：DB 候选检索子预算（ms） */
+    @Value("${rtb.timeout.db-ms:800}")
+    private long dbTimeoutMs;
+
+    /** M5：Redis 计费子预算（ms） */
+    @Value("${rtb.timeout.redis-ms:200}")
+    private long redisTimeoutMs;
+
+    /** M5：强制兜底开关，用于演示/复现「依赖全面故障」场景 */
+    @Value("${rtb.fallback.force:false}")
+    private boolean forceFallback;
+
+    /** M5：超时包裹用的有界线程池（仅阻塞式 DB/Redis 调用需要），避免 servlet 线程被长阻塞拖死 */
+    private final ExecutorService timeoutPool =
+            Executors.newFixedThreadPool(Math.max(16, Runtime.getRuntime().availableProcessors() * 4));
+
+    /** M5：DB 与 Redis 各自独立熔断器，互不影响 */
+    private final CircuitBreaker dbBreaker;
+    private final CircuitBreaker redisBreaker;
+
+    /** M5：兜底广告静态常量（Redis 不可用时的最后保底，保证永远有广告可返回） */
+    private static final Ad STATIC_FALLBACK = buildStaticFallback();
+
+    private static final String FALLBACK_AD_JSON =
+            "{\"adId\":999999,\"advertiserId\":0,\"title\":\"兜底保底广告\",\"categoryCode\":\"mobile\",\"bid\":0.01}";
+
+    private static final String FALLBACK_REDIS_KEY = "fallback:ad";
+
+    public BidService(AdMapper adMapper,
+                      BudgetService budgetService,
+                      StringRedisTemplate redis,
+                      ObjectMapper objectMapper,
+                      @Value("${rtb.circuit-breaker.failure-threshold:5}") int failureThreshold,
+                      @Value("${rtb.circuit-breaker.cooldown-ms:5000}") long cooldownMs) {
+        this.adMapper = adMapper;
+        this.budgetService = budgetService;
+        this.redis = redis;
+        this.objectMapper = objectMapper;
+        this.dbBreaker = new CircuitBreaker(failureThreshold, cooldownMs);
+        this.redisBreaker = new CircuitBreaker(failureThreshold, cooldownMs);
+        seedFallbackAd();
+    }
+
     /**
-     * 执行一次竞价。
+     * 执行一次竞价。M5 下任何「不该打 / 打失败 / 超时 / 预算耗尽」都统一收敛到兜底广告。
      */
     public BidRequest.Result bid(BidRequest req) {
         String requestId = UUID.randomUUID().toString().replace("-", "");
+        long deadline = System.nanoTime() + totalTimeoutMs * 1_000_000L;
+
+        // 强制兜底（演示/复现开关）：直接返回兜底广告，模拟依赖全面故障
+        if (forceFallback) {
+            return buildFallback(requestId);
+        }
 
         // ---------------------------------------------------------
-        // ① 候选检索：ad 全表扫 + ad_target 多维 JOIN
-        //    ad 表刻意不建索引（承担 baseline 的「慢」），
-        //    ad_target 建 idx_dim_lookup（承担「筛得准」）。M2 会把整个求交挪到内存 BitSet。
+        // ① 候选检索（套熔断 + 超时）。ORDER BY a.bid DESC 已把出价排序下推到 SQL。
         // ---------------------------------------------------------
-        List<Ad> candidates = adMapper.findCandidates(
-                req.getRegion(),
-                TargetingMapper.resolveAgeBucket(req.getAge(), req.getAgeBucket()),
-                TargetingMapper.toGender(req.getGender()),
-                req.getCategoryCode());
+        List<Ad> candidates = retrieveCandidates(req, deadline);
+        if (candidates == null) {
+            // 熔断 OPEN / 超时 / 异常 → 兜底，绝不返回空
+            return buildFallback(requestId);
+        }
 
         // ---------------------------------------------------------
-        // ② 定向过滤：M1 已在候选检索的 SQL JOIN 里完成，这里仅作拷贝占位
+        // ② 定向过滤已在 SQL 的 WHERE/JOIN 完成，这里仅作拷贝占位
         // ---------------------------------------------------------
         List<Ad> matched = new ArrayList<>(candidates);
 
-        // ---------------------------------------------------------
-        // ③ 出价排序已下推到 SQL（findCandidates 末尾 ORDER BY a.bid DESC），
-        //    应用层不再排序，matched 顺序即 DB 返回顺序（出价降序）。
-        // ---------------------------------------------------------
+        // 候选为空（检索无命中）→ 兜底，不返回空广告
+        if (matched.isEmpty()) {
+            return buildFallback(requestId);
+        }
 
         // ---------------------------------------------------------
-        // ④ 计费：二价拍卖（Vickrey）+ fall-through
+        // ③ 二价计费（Vickrey）+ fall-through
         //    候选已按出价降序（SQL ORDER BY a.bid DESC）。
-        //    胜出者 = 沿降序第一个预算充足的候选（fall-through 尽力成交）；
-        //    成交价 = min(胜出者出价, 次高出价 + 最小加价)，绝不高于自身出价。
-        //    二价价值：广告主敢报真实价，成交价由市场(次高)决定而非自身出价。
+        //    胜出者 = 沿降序第一个预算充足的候选；成交价 = min(胜出者出价, 次高出价 + 最小加价)。
+        //    套 Redis 熔断 + 整体 deadline 约束：Redis 挂 / 预算耗尽 / 超时 → 兜底。
         // ---------------------------------------------------------
         Ad winner = null;
         BigDecimal payPrice = null;
-        Integer advertiserId = null;
         Long adId = null;
+        Integer advertiserId = null;
 
-        // fall-through + 二价：沿排序后的候选列表（按出价降序）依次尝试扣预算，
-        // 命中第一个预算充足的广告即成交（前几名预算耗尽则继续往后找，真实竞价"尽力成交"）。
-        // 失败的 deduct 不会改写余额（校验不通过即返回 false，无 decrement），多试安全。
-        if (!matched.isEmpty()) {
+        if (redisBreaker.allowRequest()) {
             for (int i = 0; i < matched.size(); i++) {
+                // 整体超时预算耗尽 → 放弃后续计费，兜底收尾
+                if (System.nanoTime() > deadline) {
+                    break;
+                }
                 Ad candidate = matched.get(i);
                 // 二价成交价：次高出价 + 最小加价，且不超过自身出价
                 BigDecimal secondBid = (i + 1 < matched.size())
                         ? matched.get(i + 1).getBid()      // 下一名（次高）的出价
                         : candidate.getBid();               // 仅一名候选，次高=自身
                 BigDecimal price = secondBid.add(minIncrement).min(candidate.getBid());
-                boolean deducted = budgetService.deduct(candidate.getId(), candidate.getDailyBudget(), price);
+
+                boolean deducted;
+                try {
+                    // Redis 计费包一层超时，避免慢 Redis 拖垮整条链路
+                    deducted = withTimeout(() -> budgetService.deduct(
+                            candidate.getId(), candidate.getDailyBudget(), price), deadline);
+                    redisBreaker.onSuccess();
+                } catch (Exception e) {
+                    redisBreaker.onFailure();
+                    deducted = false;
+                }
                 if (deducted) {
                     winner = candidate;
                     payPrice = price;
-                    advertiserId = candidate.getAdvertiserId();
                     adId = candidate.getId();
+                    advertiserId = candidate.getAdvertiserId();
                     break;
                 }
             }
+        }
+
+        // Redis 熔断 OPEN / 预算全部不足 / 整体超时 → 兜底广告保底
+        if (winner == null) {
+            return buildFallback(requestId);
         }
 
         // [已注释] 分段计时埋点 + bid_log 落库（M1 baseline 压测期间不采集统计，纯服务化）
@@ -119,11 +188,119 @@ public class BidService {
         return buildResult(requestId, candidates, matched, winner, payPrice);
     }
 
+    /**
+     * ① 候选检索：熔断 OPEN 直接短路；否则用有界线程池包裹阻塞式 DB 调用并限时。
+     *
+     * @return 候选列表；任一失败（熔断/超时/异常）返回 null，由调用方走兜底
+     */
+    private List<Ad> retrieveCandidates(BidRequest req, long deadline) {
+        if (!dbBreaker.allowRequest()) {
+            return null; // 熔断 OPEN → 兜底
+        }
+        long remainingMs = (deadline - System.nanoTime()) / 1_000_000;
+        if (remainingMs <= 0) {
+            return null; // 总预算已耗尽 → 兜底
+        }
+        try {
+            List<Ad> result = CompletableFuture
+                    .supplyAsync(() -> adMapper.findCandidates(
+                            req.getRegion(),
+                            TargetingMapper.resolveAgeBucket(req.getAge(), req.getAgeBucket()),
+                            TargetingMapper.toGender(req.getGender()),
+                            req.getCategoryCode()), timeoutPool)
+                    .get(Math.min(remainingMs, dbTimeoutMs), TimeUnit.MILLISECONDS);
+            dbBreaker.onSuccess();
+            return result;
+        } catch (TimeoutException e) {
+            dbBreaker.onFailure();
+            log.warn("候选检索超时（>{}ms），走兜底", Math.min(remainingMs, dbTimeoutMs));
+            return null;
+        } catch (Exception e) {
+            dbBreaker.onFailure();
+            log.warn("候选检索异常，走兜底: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    /** 用有界线程池包裹一个阻塞调用并限时（剩余预算与子预算取小） */
+    private <T> T withTimeout(Supplier<T> supplier, long deadline) throws Exception {
+        long remainingMs = (deadline - System.nanoTime()) / 1_000_000;
+        if (remainingMs <= 0) {
+            throw new TimeoutException("整体超时预算已耗尽");
+        }
+        return CompletableFuture
+                .supplyAsync(supplier, timeoutPool)
+                .get(Math.min(remainingMs, redisTimeoutMs), TimeUnit.MILLISECONDS);
+    }
+
+    /** 兜底广告出口：Redis 优先，失败回退静态常量。hasAd=1、fallback=true、不计二价 */
+    private BidRequest.Result buildFallback(String requestId) {
+        Ad ad = loadFallbackAd();
+        BidRequest.Result r = new BidRequest.Result();
+        r.setRequestId(requestId);
+        r.setHasAd(true);
+        r.setFallback(true);
+        r.setPriceMode(2);          // 2 = 兜底，区别于 0 一价 / 1 二价
+        r.setPayPrice(null);        // 兜底不计费
+        r.setCandidateCnt(0);
+        r.setMatchCnt(0);
+        r.setTopCandidates(List.of());
+
+        BidRequest.AdInfo info = new BidRequest.AdInfo();
+        info.setAdId(ad.getId());
+        info.setAdvertiserId(ad.getAdvertiserId());
+        info.setTitle(ad.getTitle());
+        info.setCategoryCode(ad.getCategoryCode());
+        info.setBid(ad.getBid());
+        r.setWinner(info);
+        return r;
+    }
+
+    /** 从 Redis 读兜底广告；缺失或解析失败则回退静态常量 */
+    private Ad loadFallbackAd() {
+        try {
+            String s = redis.opsForValue().get(FALLBACK_REDIS_KEY);
+            if (s != null && !s.isBlank()) {
+                Map<String, Object> m = objectMapper.readValue(s, Map.class);
+                Ad a = new Ad();
+                a.setId(Long.parseLong(String.valueOf(m.get("adId"))));
+                a.setAdvertiserId(Integer.parseInt(String.valueOf(m.get("advertiserId"))));
+                a.setTitle(String.valueOf(m.get("title")));
+                a.setCategoryCode(String.valueOf(m.get("categoryCode")));
+                a.setBid(new BigDecimal(String.valueOf(m.get("bid"))));
+                return a;
+            }
+        } catch (Exception e) {
+            log.warn("读取 Redis 兜底广告失败，回退静态兜底: {}", e.getMessage());
+        }
+        return STATIC_FALLBACK;
+    }
+
+    /** 启动时把兜底广告写入 Redis（best-effort，Redis 不在也可后续用静态常量） */
+    private void seedFallbackAd() {
+        try {
+            redis.opsForValue().setIfAbsent(FALLBACK_REDIS_KEY, FALLBACK_AD_JSON);
+        } catch (Exception e) {
+            log.warn("兜底广告预热到 Redis 失败（将仅使用静态兜底）: {}", e.getMessage());
+        }
+    }
+
+    private static Ad buildStaticFallback() {
+        Ad a = new Ad();
+        a.setId(999999L);
+        a.setAdvertiserId(0);
+        a.setTitle("兜底保底广告");
+        a.setCategoryCode("mobile");
+        a.setBid(BigDecimal.valueOf(0.01));
+        return a;
+    }
+
     private BidRequest.Result buildResult(String requestId, List<Ad> candidates,
                                           List<Ad> matched, Ad winner, BigDecimal payPrice) {
         BidRequest.Result r = new BidRequest.Result();
         r.setRequestId(requestId);
         r.setHasAd(winner != null);
+        r.setFallback(false);
         r.setCandidateCnt(candidates.size());
         r.setMatchCnt(matched.size());
         // 1 = 二价（M4 引入：成交价=次高出价+最小加价，不超过自身出价）
