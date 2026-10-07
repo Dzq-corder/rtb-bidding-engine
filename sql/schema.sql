@@ -42,7 +42,7 @@ CREATE TABLE ad (
   title       VARCHAR(128)    NOT NULL COMMENT '创意标题，由行业前缀 x 品牌词 x 产品词组合',
   creative_url  VARCHAR(255)    NOT NULL COMMENT '素材地址',
   category_code VARCHAR(32)     NOT NULL COMMENT '行业类目，Zipf 分布',
-  bid           DECIMAL(10,2)   NOT NULL COMMENT '出价，单位元，对数正态长尾',
+  bid           DECIMAL(10,4)   NOT NULL COMMENT '单次展示出价（元）= CPM/1000；真实计价下为几分钱，CPM 用对数正态长尾',
   daily_budget  DECIMAL(12,2)   NOT NULL COMMENT '日预算，离散档位',
   status        TINYINT         NOT NULL DEFAULT 1 COMMENT '1在投 2暂停 3已耗尽',
   created_at    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
