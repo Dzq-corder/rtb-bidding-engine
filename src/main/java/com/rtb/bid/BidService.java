@@ -6,6 +6,7 @@ import com.rtb.ad.AdMapper;
 import com.rtb.budget.BudgetService;
 import com.rtb.counter.BidEvent;
 import com.rtb.counter.BidEventPublisher;
+import com.rtb.detail.BidDetailBuffer;
 import com.rtb.resilience.CircuitBreaker;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -13,6 +14,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -55,6 +57,8 @@ public class BidService {
     private final StringRedisTemplate redis;
     private final ObjectMapper objectMapper;
     private final BidEventPublisher bidEventPublisher;
+    /** M7：竞价明细异步落库缓冲（本地有界队列 + 后台批量刷盘） */
+    private final BidDetailBuffer bidDetailBuffer;
 
     /** 二价最小加价单位（元）。默认 1 分，可通过 rtb.min-increment 覆盖 */
     @Value("${rtb.min-increment:0.01}")
@@ -97,6 +101,7 @@ public class BidService {
                       StringRedisTemplate redis,
                       ObjectMapper objectMapper,
                       BidEventPublisher bidEventPublisher,
+                      BidDetailBuffer bidDetailBuffer,
                       @Value("${rtb.circuit-breaker.failure-threshold:5}") int failureThreshold,
                       @Value("${rtb.circuit-breaker.cooldown-ms:5000}") long cooldownMs) {
         this.adMapper = adMapper;
@@ -104,6 +109,7 @@ public class BidService {
         this.redis = redis;
         this.objectMapper = objectMapper;
         this.bidEventPublisher = bidEventPublisher;
+        this.bidDetailBuffer = bidDetailBuffer;
         this.dbBreaker = new CircuitBreaker(failureThreshold, cooldownMs);
         this.redisBreaker = new CircuitBreaker(failureThreshold, cooldownMs);
         seedFallbackAd();
@@ -115,23 +121,28 @@ public class BidService {
      */
     public BidRequest.Result bid(BidRequest req) {
         String requestId = UUID.randomUUID().toString().replace("-", "");
-        long deadline = System.nanoTime() + totalTimeoutMs * 1_000_000L;
+        long startNanos = System.nanoTime();
+        long deadline = startNanos + totalTimeoutMs * 1_000_000L;
+        int candidateCostMs = 0;
+        int billCostMs = 0;
 
         // 强制兜底（演示/复现开关）：直接返回兜底广告，模拟依赖全面故障
         if (forceFallback) {
             BidRequest.Result r = buildFallback(requestId);
-            publishBidEvent(requestId, req.getRegion(), r);
+            emit(requestId, req, r, ms(startNanos, System.nanoTime()), 0, 0);
             return r;
         }
 
         // ---------------------------------------------------------
         // ① 候选检索（套熔断 + 超时）。ORDER BY a.bid DESC 已把出价排序下推到 SQL。
         // ---------------------------------------------------------
+        long cStart = System.nanoTime();
         List<Ad> candidates = retrieveCandidates(req, deadline);
+        candidateCostMs = ms(cStart, System.nanoTime());
         if (candidates == null) {
             // 熔断 OPEN / 超时 / 异常 → 兜底，绝不返回空
             BidRequest.Result r = buildFallback(requestId);
-            publishBidEvent(requestId, req.getRegion(), r);
+            emit(requestId, req, r, ms(startNanos, System.nanoTime()), candidateCostMs, 0);
             return r;
         }
 
@@ -143,7 +154,7 @@ public class BidService {
         // 候选为空（检索无命中）→ 兜底，不返回空广告
         if (matched.isEmpty()) {
             BidRequest.Result r = buildFallback(requestId);
-            publishBidEvent(requestId, req.getRegion(), r);
+            emit(requestId, req, r, ms(startNanos, System.nanoTime()), candidateCostMs, 0);
             return r;
         }
 
@@ -158,6 +169,7 @@ public class BidService {
         Long adId = null;
         Integer advertiserId = null;
 
+        long bStart = System.nanoTime();
         if (redisBreaker.allowRequest()) {
             for (int i = 0; i < matched.size(); i++) {
                 // 整体超时预算耗尽 → 放弃后续计费，兜底收尾
@@ -191,10 +203,12 @@ public class BidService {
             }
         }
 
+        billCostMs = ms(bStart, System.nanoTime());
+
         // Redis 熔断 OPEN / 预算全部不足 / 整体超时 → 兜底广告保底
         if (winner == null) {
             BidRequest.Result r = buildFallback(requestId);
-            publishBidEvent(requestId, req.getRegion(), r);
+            emit(requestId, req, r, ms(startNanos, System.nanoTime()), candidateCostMs, billCostMs);
             return r;
         }
 
@@ -204,7 +218,7 @@ public class BidService {
         //         costMs, candidateCost, filterCost, sortCost, billCost);
 
         BidRequest.Result r = buildResult(requestId, candidates, matched, winner, payPrice);
-        publishBidEvent(requestId, req.getRegion(), r);
+        emit(requestId, req, r, ms(startNanos, System.nanoTime()), candidateCostMs, billCostMs);
         return r;
     }
 
@@ -231,6 +245,52 @@ public class BidService {
         } catch (Exception ex) {
             log.warn("发布竞价事件失败（忽略，不影响竞价返回）requestId={}: {}", requestId, ex.getMessage());
         }
+    }
+
+    /**
+     * M7：把一次竞价结果「事件旁路(Kafka) + 明细落库(本地队列)」合并发出。
+     * 主链路每个 return 前调用一次，保证计费事件与竞价明细一一对应、且都不阻塞返回。
+     *
+     * @param costMs          整条链路总耗时（ms），入链到 return 的墙钟时间
+     * @param candidateCostMs 候选检索耗时（ms），DB 调用，含 SQL 内定向过滤/排序
+     * @param billCostMs     计费耗时（ms），Redis 预算扣减循环
+     */
+    private void emit(String requestId, BidRequest req, BidRequest.Result r,
+                      int costMs, int candidateCostMs, int billCostMs) {
+        // 1) 计费事件旁路（Kafka，fire-and-forget，不阻塞）
+        publishBidEvent(requestId, req.getRegion(), r);
+        // 2) 竞价明细入本地有界队列，后台线程批量落库（可丢、可采样）
+        try {
+            BidLog log = new BidLog();
+            log.setRequestId(requestId);
+            log.setAdId(r.getWinner() != null ? r.getWinner().getAdId() : null);
+            log.setAdvertiserId(r.getWinner() != null ? r.getWinner().getAdvertiserId() : null);
+            log.setSlotCode(req.getSlotCode());
+            log.setRegion(req.getRegion());
+            log.setAge(req.getAge());
+            log.setGender(req.getGender());
+            log.setInterests(req.getInterests() != null ? req.getInterests() : "");
+            log.setCandidateCnt(r.getCandidateCnt());
+            log.setMatchCnt(r.getMatchCnt());
+            log.setHasAd(Boolean.TRUE.equals(r.getHasAd()) ? 1 : 0);
+            log.setWinBid(r.getWinner() != null ? r.getWinner().getBid() : null);
+            log.setPayPrice(r.getPayPrice());
+            log.setCostMs(costMs);
+            log.setCandidateCost(candidateCostMs);
+            // 定向过滤与出价排序在 M1 已下推进 SQL（WHERE/JOIN/ORDER BY a.bid DESC），
+            // 不单独计时，瓶颈完全落在 candidate_cost（DB 检索）。
+            log.setFilterCost(0);
+            log.setSortCost(0);
+            log.setBillCost(billCostMs);
+            log.setBidAt(LocalDateTime.now());
+            bidDetailBuffer.enqueue(log);
+        } catch (Exception ex) {
+            log.warn("构造/入队竞价明细失败（忽略，不影响竞价返回）requestId={}: {}", requestId, ex.getMessage());
+        }
+    }
+
+    private static int ms(long fromNanos, long toNanos) {
+        return (int) ((toNanos - fromNanos) / 1_000_000);
     }
 
     /**
