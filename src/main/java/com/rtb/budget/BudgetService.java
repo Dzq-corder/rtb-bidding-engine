@@ -2,25 +2,30 @@ package com.rtb.budget;
 
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
+import java.util.Arrays;
+import java.util.List;
 
 /**
- * 预算服务 · M1 朴素实现
+ * 预算服务
  *
- * <p><b>本轮刻意不做原子性封装</b>：余额校验和扣减是两条独立命令、
- * 两次往返。M3 才把它们合并进一个 Lua 脚本。
+ * <p><b>M3 实现：Lua 原子扣减</b>。把「读余额 → 校验 → 扣减 → 记消耗」收进
+ * 一个 Lua 脚本，由 Redis 单线程原子执行，消除 M1 两步写法的并发超扣窗口。
  *
- * <p><b>为什么这不是「故意写丑」</b>：校验 + 扣减分两步是最直观、最容易
- * 想到的写法，它是「正确的实现，尚未加固」。真正的并发超扣问题要等到
- * 有实际并发压测时才会暴露，M3 的 Lua 脚本是对那个问题的直接回应。
- * 面试时的表述是：「初版用两步做，压测发现会超扣，改成 Lua 原子操作」——
- * 这比一开始就写 Lua 更可信，因为前者说明你真的遇到过那个问题。
+ * <p><b>为什么 M1 没这么做</b>：M1 用 {@code GET → 比较 → decrement} 三步、两次往返，
+ * 是最直观的写法。并发下请求 A、B 同时读到余额 10 元，都通过校验、各自扣 8 元，
+ * 余额变成 -6 元，超扣发生。这一段「先量 baseline、再针对性加固」正是简历上
+ * 「由 A 降到 B」的证据链：M1 暴露问题 → M3 用 Lua 把超扣压到 0。
  *
- * <p>Key 命名：{@code budget:{adId}:{yyyyMMdd}}，按天分桶让过期策略自然生效。
+ * <p><b>Key 命名</b>：{@code budget:{adId}:{yyyyMMdd}} 剩余预算(分)，
+ * {@code spent:{adId}:{yyyyMMdd}} 累计消耗(分)。按天分桶让过期策略自然生效。
+ * 金额统一以「分」为单位存 Redis，避免 double 浮点误差。
  */
 @Slf4j
 @Service
@@ -28,63 +33,73 @@ public class BudgetService {
 
     private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("yyyyMMdd");
 
+    /**
+     * 原子预算扣减脚本。
+     * KEYS[1] = budget:{adId}:{date} 剩余预算(分)
+     * KEYS[2] = spent:{adId}:{date}  累计消耗(分)
+     * ARGV[1] = 本次扣减额(分)
+     * ARGV[2] = 日预算(分)，key 缺失时用于播种
+     * 返回：1 = 扣减成功；0 = 余额不足（含播种后仍不足）
+     */
+    private static final String DEDUCT_LUA =
+            "local bal = redis.call('GET', KEYS[1])\n" +
+            "if not bal then\n" +
+            "  bal = ARGV[2]\n" +
+            "  redis.call('SET', KEYS[1], bal)\n" +
+            "  redis.call('SET', KEYS[2], 0)\n" +
+            "end\n" +
+            "local amt = tonumber(ARGV[1])\n" +
+            "local remain = tonumber(bal)\n" +
+            "if remain < amt then\n" +
+            "  return 0\n" +
+            "end\n" +
+            "redis.call('DECRBY', KEYS[1], amt)\n" +
+            "redis.call('INCRBY', KEYS[2], amt)\n" +
+            "return 1\n";
+
+    private static final RedisScript<Long> DEDUCT_SCRIPT = new DefaultRedisScript<>(DEDUCT_LUA, Long.class);
+
     private final StringRedisTemplate redis;
 
     public BudgetService(StringRedisTemplate redis) {
         this.redis = redis;
     }
 
-    private String key(Long adId) {
+    private String budgetKey(Long adId) {
         return "budget:" + adId + ":" + LocalDate.now().format(DATE_FMT);
     }
 
+    private String spentKey(Long adId) {
+        return "spent:" + adId + ":" + LocalDate.now().format(DATE_FMT);
+    }
+
     /**
-     * 查询当前余额，不存在则按广告日预算初始化。
-     *
-     * <p>惰性初始化：Redis 里没有就查 MySQL 拿日预算写进去。
-     * M3 起这里会配合批量预热，避免竞价链路上出现初始化写。
+     * 查询当前余额，不存在则按广告日预算初始化（惰性初始化，播种来自 MySQL）。
+     * M3 起检索阶段会批量预热，避免竞价链路上出现初始化写。
      */
     public BigDecimal getBalance(Long adId, BigDecimal dailyBudget) {
-        String v = redis.opsForValue().get(key(adId));
+        String v = redis.opsForValue().get(budgetKey(adId));
         if (v == null) {
             initIfAbsent(adId, dailyBudget);
-            v = redis.opsForValue().get(key(adId));
+            v = redis.opsForValue().get(budgetKey(adId));
         }
         return parse(v == null ? String.valueOf(toCents(dailyBudget)) : v);
     }
 
     /**
-     * 扣减预算。M1 版本：三步操作，非原子。
+     * 扣减预算。M3 版本：单个 Lua 脚本原子完成「校验 → 扣减 → 记消耗」。
      *
-     * <p>并发下的错位场景：请求 A、B 同时读到余额 10 元，都通过校验，
-     * 各自扣 8 元，结果余额变成 -6 元，超扣发生。
-     * M3 用 Lua 把三步收进一个原子操作，消除这个窗口。
+     * <p>Redis 以单线程执行 Lua，脚本运行期间不会被其他命令打断，因此并发请求
+     * 之间不存在「都读到旧余额、都通过校验」的窗口，超扣被彻底消除。
      *
-     * @return true 扣减成功；false 余额不足
+     * @return true 扣减成功（脚本返回 1）；false 余额不足（脚本返回 0）
      */
     public boolean deduct(Long adId, BigDecimal dailyBudget, BigDecimal amount) {
-        String k = key(adId);
-
-        // 第一步：读余额
-        String cur = redis.opsForValue().get(k);
-        if (cur == null) {
-            // 初始化后必须重新读，不能用 dailyBudget 的字符串代替：
-            // 存进 Redis 的是「分」，直接用「元」的字符串会差100 倍
-            initIfAbsent(adId, dailyBudget);
-            cur = redis.opsForValue().get(k);
-            if (cur == null) {
-                cur = String.valueOf(toCents(dailyBudget));
-            }
-        }
-
-        // 第二步：校验
-        if (parse(cur).compareTo(amount) < 0) {
-            return false;
-        }
-
-        // 第三步：扣减
-        redis.opsForValue().decrement(k, toCents(amount));
-        return true;
+        List<String> keys = Arrays.asList(budgetKey(adId), spentKey(adId));
+        Long result = redis.execute(DEDUCT_SCRIPT, keys,
+                String.valueOf(toCents(amount)),
+                String.valueOf(toCents(dailyBudget)));
+        return result != null && result == 1L;
     }
 
     /** 金额统一以「分」为单位存进 Redis，避免 double 的浮点误差 */
@@ -98,7 +113,7 @@ public class BudgetService {
     }
 
     private void initIfAbsent(Long adId, BigDecimal dailyBudget) {
-        redis.opsForValue().setIfAbsent(key(adId), String.valueOf(toCents(dailyBudget)));
+        redis.opsForValue().setIfAbsent(budgetKey(adId), String.valueOf(toCents(dailyBudget)));
     }
 
     /**
