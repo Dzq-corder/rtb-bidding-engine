@@ -98,8 +98,8 @@ CREATE TABLE bid_log (
   candidate_cnt  INT             NOT NULL COMMENT '定向过滤前候选数，目标 100~200',
   match_cnt      INT             NOT NULL COMMENT '定向过滤后数量，目标 10~30',
   has_ad         TINYINT         NOT NULL COMMENT '1有广告 0空广告',
-  win_bid        DECIMAL(10,2)            DEFAULT NULL COMMENT '胜出出价',
-  pay_price      DECIMAL(10,2)            DEFAULT NULL COMMENT '实际扣费，M1 一价、M4 起二价',
+  win_bid        DECIMAL(10,4)            DEFAULT NULL COMMENT '胜出出价',
+  pay_price      DECIMAL(10,4)            DEFAULT NULL COMMENT '实际扣费，M1 一价、M4 起二价',
   -- 耗时分段（毫秒），用于定位瓶颈
   cost_ms        INT             NOT NULL COMMENT '竞价总耗时',
   candidate_cost INT             NOT NULL COMMENT '候选检索耗时，M2 优化的核心指标',
@@ -128,9 +128,9 @@ CREATE TABLE billing_event (
   request_id     CHAR(32)        NOT NULL COMMENT '来源竞价请求 ID，关联 bid_log.request_id',
   ad_id          BIGINT UNSIGNED NOT NULL COMMENT '广告 ID，关联 ad.id',
   advertiser_id  INT UNSIGNED    NOT NULL COMMENT '广告主 ID，关联 ad.advertiser_id',
-  bid_price      DECIMAL(10,2)   NOT NULL COMMENT '胜出出价',
-  pay_price      DECIMAL(10,2)   NOT NULL COMMENT '实际扣费',
-  second_price   DECIMAL(10,2)            DEFAULT NULL COMMENT '次高价，二价结算依据；一价时为 NULL',
+  bid_price      DECIMAL(10,4)   NOT NULL COMMENT '胜出出价',
+  pay_price      DECIMAL(10,4)   NOT NULL COMMENT '实际扣费',
+  second_price   DECIMAL(10,4)            DEFAULT NULL COMMENT '次高价，二价结算依据；一价时为 NULL',
   is_second_price TINYINT        NOT NULL DEFAULT 0 COMMENT '1二价 0一价（M1 阶段恒为 0）',
   billed_at      DATETIME(3)     NOT NULL COMMENT '计费时间，M8-3 按此字段做 RANGE 分区',
   PRIMARY KEY (id),
@@ -157,7 +157,7 @@ CREATE TABLE bid_stat_hourly (
   ad_cnt        BIGINT UNSIGNED NOT NULL COMMENT '返回广告数，cnt - ad_cnt 即空广告数',
   avg_cost_ms   INT NOT NULL COMMENT '平均耗时',
   p99_cost_ms   INT NOT NULL COMMENT 'P99 耗时，消费端内存滑动窗口计算',
-  avg_pay_price DECIMAL(10,2) NOT NULL COMMENT '平均成交价',
+  avg_pay_price DECIMAL(10,4) NOT NULL COMMENT '平均成交价',
   total_cost    DECIMAL(14,2) NOT NULL COMMENT '总消耗',
   PRIMARY KEY (stat_hour, slot_code, category_code)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='小时级预聚合大盘';
