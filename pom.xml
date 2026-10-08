@@ -61,19 +61,6 @@
       <artifactId>spring-kafka</artifactId>
     </dependency>
 
-    <!-- 本地二级缓存（M3 热更新用） -->
-    <dependency>
-      <groupId>com.github.ben-manes.caffeine</groupId>
-      <artifactId>caffeine</artifactId>
-    </dependency>
-
-    <!-- Redisson：分布式锁与 Bloom（M3/M6 用） -->
-    <dependency>
-      <groupId>org.redisson</groupId>
-      <artifactId>redisson-spring-boot-starter</artifactId>
-      <version>3.27.2</version>
-    </dependency>
-
     <dependency>
       <groupId>org.projectlombok</groupId>
       <artifactId>lombok</artifactId>

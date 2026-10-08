@@ -7,7 +7,7 @@
   <!--
     M1 候选检索：ad 全表扫 + ad_target 多维 JOIN
     ==============================================
-    预期执行计划（建 sql/m1_indexes.sql 后）：
+    预期执行计划（建 all-schema.sql 后）：
       ad             type: ALL  | key: NULL        刻意保留，baseline 的「慢」在这
       t1/t2/t3       type: ref  | key: idx_dim_lookup
 

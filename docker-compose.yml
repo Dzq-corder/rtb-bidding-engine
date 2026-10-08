@@ -1,9 +1,18 @@
-# RTB 投放引擎 · 中间件环境
+# RTB 投放引擎 · 中间件环境（全新实例变体）
 #
-# 用法：docker compose up -d     启动三个中间件
-#      docker compose ps        确认三个都是 healthy
-#      docker compose down      停止（保留数据卷）
-#      docker compose down -v   停止并删除数据卷（会清空数据，慎用）
+# 本文件的容器名 / 数据卷名统一带 rtb2- 前缀，与旧实例（rtb-mysql /
+# rtb-redis / rtb-kafka + mysql-data / kafka-data）完全隔离：
+#   —— 旧容器原样保留，数据不丢；
+#   —— 新容器用全新数据卷，启动即为空库，可重新造数 / 压测。
+#
+# 用法：
+#   1) 先释放旧容器占用的宿主机端口（不删容器、不动旧数据卷）：
+#        docker stop rtb-mysql rtb-redis rtb-kafka
+#   2) 启动新实例：
+#        docker compose up -d        # 创建 rtb2-* 容器 + 全新数据卷
+#        docker compose ps           # 确认三个都是 healthy
+#        docker compose down         # 停止新实例（保留 rtb2 数据卷）
+#        docker compose down -v      # 停止并删除 rtb2 数据卷（慎用）
 #
 # 约定：中间件由人工启动，本项目不提供自动起容器的脚本。
 #       服务本身跑在宿主：mvn spring-boot:run 或 java -jar target/*.jar
@@ -11,7 +20,7 @@
 # 启动前请确认 Docker Desktop 内存分配 >= 8GB：
 #       MySQL 装 1000 万行 + Kafka JVM + 宿主 JVM 同时运行，2GB 会 OOM。
 
-name: rtb
+name: rtb2
 
 services:
 
@@ -21,7 +30,7 @@ services:
   # ---------------------------------------------------------------------
   mysql:
     image: mysql:8.0
-    container_name: rtb-mysql
+    container_name: rtb2-mysql
     restart: unless-stopped
     ports:
       - "3306:3306"
@@ -44,7 +53,7 @@ services:
       - --slow-query-log=1
       - --long-query-time=0.1
     volumes:
-      - mysql-data:/var/lib/mysql
+      - mysql-data-rtb2:/var/lib/mysql
       # 造数用CSV 挂载点。不用 docker cp 往容器里塞文件：
       # MySQL 8 镜像的 ENTRYPOINT 会重建 /tmp，导致 cp 进去的文件静默消失
       #（表现为命令报 Copied 但 ls 看不到文件）。
@@ -62,7 +71,7 @@ services:
   # ---------------------------------------------------------------------
   redis:
     image: redis:7-alpine
-    container_name: rtb-redis
+    container_name: rtb2-redis
     restart: unless-stopped
     ports:
       - "6379:6379"
@@ -101,7 +110,7 @@ services:
   # ---------------------------------------------------------------------
   kafka:
     image: apache/kafka:3.7.0
-    container_name: rtb-kafka
+    container_name: rtb2-kafka
     restart: unless-stopped
     ports:
       - "9092:9092"
@@ -124,7 +133,7 @@ services:
       KAFKA_LOG_SEGMENT_BYTES: "268435456"
       KAFKA_HEAP_OPTS: "-Xmx768M -Xms256M"
     volumes:
-      - kafka-data:/var/lib/kafka/data
+      - kafka-data-rtb2:/var/lib/kafka/data
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
       interval: 15s
@@ -133,5 +142,5 @@ services:
       start_period: 30s
 
 volumes:
-  mysql-data:
-  kafka-data:
+  mysql-data-rtb2:
+  kafka-data-rtb2:

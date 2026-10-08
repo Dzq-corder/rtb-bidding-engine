@@ -14,7 +14,7 @@ import java.util.Map;
  * 候选集要落在 100~200 条（否则造数与演示都不成立），
  * 而检索要足够慢（否则 M2 没有对照价值）。
  * 解法是分工：<b>ad 表不建索引承担「慢」</b>，<b>ad_target 建索引承担「筛得准」</b>。
- * 详见 {@code sql/m1_indexes.sql}。
+ * 详见 {@code sql/all-schema.sql}。
  */
 @Mapper
 public interface AdMapper {
