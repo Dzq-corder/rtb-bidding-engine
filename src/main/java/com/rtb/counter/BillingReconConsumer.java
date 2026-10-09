@@ -7,6 +7,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.support.Acknowledgment;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 
@@ -34,6 +35,7 @@ public class BillingReconConsumer {
     }
 
     @KafkaListener(groupId = "billing-recon", topics = "${rtb.kafka.topic:bid_event}")
+    @Transactional
     public void onEvent(ConsumerRecord<String, String> rec, Acknowledgment ack) {
         try {
             BidEvent e = objectMapper.readValue(rec.value(), BidEvent.class);
@@ -58,7 +60,8 @@ public class BillingReconConsumer {
             ack.acknowledge();
         } catch (Exception ex) {
             log.error("billing-recon 处理失败（未 ack，将重投）event={}: {}", rec.value(), ex.getMessage());
-            // 不 ack → 消息重投，保证至少一次投递
+            // 重新抛出：触发 @Transactional 回滚，去重标记与业务写同进同退；不 ack → 重投重试
+            throw new RuntimeException(ex);
         }
     }
 }

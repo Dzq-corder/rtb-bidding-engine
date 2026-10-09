@@ -7,6 +7,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.support.Acknowledgment;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
 
 /**
  * 消费组：freq-antifraud（频次与反作弊）。
@@ -32,6 +33,7 @@ public class FreqAntifraudConsumer {
     }
 
     @KafkaListener(groupId = "freq-antifraud", topics = "${rtb.kafka.topic:bid_event}")
+    @Transactional
     public void onEvent(ConsumerRecord<String, String> rec, Acknowledgment ack) {
         try {
             BidEvent e = objectMapper.readValue(rec.value(), BidEvent.class);
@@ -48,6 +50,8 @@ public class FreqAntifraudConsumer {
             ack.acknowledge();
         } catch (Exception ex) {
             log.error("freq-antifraud 处理失败（未 ack，将重投）event={}: {}", rec.value(), ex.getMessage());
+            // 重新抛出：触发 @Transactional 回滚，去重标记与频次累加同进同退；不 ack → 重投重试
+            throw new RuntimeException(ex);
         }
     }
 }
