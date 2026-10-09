@@ -115,6 +115,10 @@ rtb:
     # OPEN 冷却时长（ms），到期后 HALF_OPEN 放一个探活，成功自愈
     cooldown-ms: 5000
   fallback:
+    # 兜底总开关。生产语义下恒为 true：任何失败都必须收敛到兜底广告。
+    # 置 false 仅用于 A/B 对照实验——复现「没有兜底机制的旧实现」，
+    # 所有失败出口直接返回空广告（hasAd=false），用来测量改造前的空广告率。
+    enabled: true
     # 强制兜底开关：true 时所有请求直接返回兜底广告，用于复现「依赖全面故障」
     force: false
   detail:

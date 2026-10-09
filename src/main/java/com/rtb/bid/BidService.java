@@ -80,6 +80,14 @@ public class BidService {
     @Value("${rtb.fallback.force:false}")
     private boolean forceFallback;
 
+    /**
+     * 兜底总开关。<b>仅用于 A/B 对照实验</b>：置 false 时复现「没有兜底机制的旧实现」——
+     * 所有失败出口直接返回空广告（hasAd=false），用来测量改造前的空广告率。
+     * 生产语义下恒为 true：任何失败都必须收敛到兜底广告。
+     */
+    @Value("${rtb.fallback.enabled:true}")
+    private boolean fallbackEnabled;
+
     /** M5：超时包裹用的有界线程池（仅阻塞式 DB/Redis 调用需要），避免 servlet 线程被长阻塞拖死 */
     private final ExecutorService timeoutPool =
             Executors.newFixedThreadPool(Math.max(16, Runtime.getRuntime().availableProcessors() * 4));
@@ -340,6 +348,18 @@ public class BidService {
 
     /** 兜底广告出口：Redis 优先，失败回退静态常量。hasAd=1、fallback=true、不计二价 */
     private BidRequest.Result buildFallback(String requestId) {
+        // A/B 对照组：兜底关闭时返回真正的空广告，用于测量改造前的空广告率
+        if (!fallbackEnabled) {
+            BidRequest.Result empty = new BidRequest.Result();
+            empty.setRequestId(requestId);
+            empty.setHasAd(false);
+            empty.setFallback(false);
+            empty.setPriceMode(2);
+            empty.setCandidateCnt(0);
+            empty.setMatchCnt(0);
+            empty.setTopCandidates(List.of());
+            return empty;
+        }
         Ad ad = loadFallbackAd();
         BidRequest.Result r = new BidRequest.Result();
         r.setRequestId(requestId);
