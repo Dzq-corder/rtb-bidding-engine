@@ -6,6 +6,8 @@ import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Service;
 
+import com.rtb.ad.AdMapper;
+
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
@@ -60,9 +62,11 @@ public class BudgetService {
     private static final RedisScript<Long> DEDUCT_SCRIPT = new DefaultRedisScript<>(DEDUCT_LUA, Long.class);
 
     private final StringRedisTemplate redis;
+    private final AdMapper adMapper;
 
-    public BudgetService(StringRedisTemplate redis) {
+    public BudgetService(StringRedisTemplate redis, AdMapper adMapper) {
         this.redis = redis;
+        this.adMapper = adMapper;
     }
 
     private String budgetKey(Long adId) {
@@ -99,7 +103,19 @@ public class BudgetService {
         Long result = redis.execute(DEDUCT_SCRIPT, keys,
                 String.valueOf(toCents(amount)),
                 String.valueOf(toCents(dailyBudget)));
-        return result != null && result == 1L;
+        boolean ok = result != null && result == 1L;
+        if (!ok) {
+            // 余额不足（含零头不够一次整扣）：标记广告当日已耗尽。
+            // 检索 SQL 带 WHERE a.status = 1，标记后该广告在候选阶段即被排除，
+            // 避免后续请求重复跑扣减判断。
+            // 注意：Redis 不可达时 redis.execute 抛异常、走不到这里，不会误标 status。
+            try {
+                adMapper.markExhausted(adId);
+            } catch (Exception ex) {
+                log.warn("标记广告已耗尽失败 adId={}: {}", adId, ex.getMessage());
+            }
+        }
+        return ok;
     }
 
     /** 金额统一以「分」为单位存进 Redis，避免 double 的浮点误差 */

@@ -2,6 +2,7 @@ package com.rtb.ad;
 
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
+import org.apache.ibatis.annotations.Update;
 
 import java.util.List;
 import java.util.Map;
@@ -62,4 +63,14 @@ public interface AdMapper {
      * 测出来的分布与真实流量不符。按命中数加权后才一致。
      */
     List<Map<String, Object>> countTargetingValues(@Param("dimTypes") List<Integer> dimTypes);
+
+    /**
+     * 标记广告当日预算已耗尽（status=1 -> 3）。
+     *
+     * <p>仅当广告当前在投（status=1）时才更新，已是 3 的不动，重复调用幂等。
+     * 由 BudgetService 在 deduct 余额不足时调用；检索 SQL 带
+     * {@code WHERE a.status = 1}，标记后该广告在候选阶段即被排除。
+     */
+    @Update("UPDATE ad SET status = 3 WHERE id = #{id} AND status = 1")
+    int markExhausted(@Param("id") Long id);
 }
