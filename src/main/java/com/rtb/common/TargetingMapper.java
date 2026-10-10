@@ -1,4 +1,4 @@
-package com.rtb.bid;
+package com.rtb.common;
 
 /**
  * 定向值映射：把请求里的原始画像值翻译成 ad_target.dim_value 的取值。

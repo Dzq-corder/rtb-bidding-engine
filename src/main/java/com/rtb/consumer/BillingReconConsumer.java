@@ -1,4 +1,4 @@
-package com.rtb.counter;
+package com.rtb.consumer;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
@@ -10,6 +10,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import com.rtb.dto.BidEvent;
 
 /**
  * 消费组：billing-recon（计费对账）。

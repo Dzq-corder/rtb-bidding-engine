@@ -2,7 +2,7 @@
 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
         "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
 
-<mapper namespace="com.rtb.bid.BidLogMapper">
+<mapper namespace="com.rtb.mapper.BidLogMapper">
 
   <!--
     M1 写入：朴素实现，单条 INSERT
@@ -14,7 +14,7 @@
     bid_log 的 uk_request 是幂等键，但 M1 阶段一个 request_id 只写一次，
     幂等消费是 M6 Kafka 旁路的职责，两者不要混。
   -->
-  <insert id="insert" parameterType="com.rtb.bid.BidLog"
+  <insert id="insert" parameterType="com.rtb.entity.BidLog"
           useGeneratedKeys="true" keyProperty="id">
     INSERT INTO bid_log (
       request_id, ad_id, advertiser_id, slot_code,

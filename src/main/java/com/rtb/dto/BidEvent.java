@@ -1,4 +1,4 @@
-package com.rtb.counter;
+package com.rtb.dto;
 
 import lombok.AllArgsConstructor;
 import lombok.Builder;

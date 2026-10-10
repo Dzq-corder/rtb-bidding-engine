@@ -1,4 +1,4 @@
-package com.rtb.resilience;
+package com.rtb.common;
 
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;

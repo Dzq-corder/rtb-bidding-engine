@@ -2,7 +2,7 @@
 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
         "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
 
-<mapper namespace="com.rtb.ad.AdMapper">
+<mapper namespace="com.rtb.mapper.AdMapper">
 
   <!--
     M1 候选检索：ad 全表扫 + ad_target 多维 JOIN
@@ -19,7 +19,7 @@
     为什么用 <if> 拼 JOIN 而不用别的写法：
       语义直白，面试时可以逐段讲清楚「哪一段是 M2 要换掉的」。
   -->
-  <select id="findCandidates" resultType="com.rtb.ad.Ad">
+  <select id="findCandidates" resultType="com.rtb.entity.Ad">
     SELECT a.id, a.advertiser_id, a.title, a.creative_url, a.category_code,
            a.bid, a.daily_budget, a.status, a.created_at, a.updated_at
     FROM ad a

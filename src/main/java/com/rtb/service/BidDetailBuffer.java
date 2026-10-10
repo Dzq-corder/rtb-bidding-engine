@@ -1,6 +1,6 @@
-package com.rtb.detail;
+package com.rtb.service;
 
-import com.rtb.bid.BidLog;
+import com.rtb.entity.BidLog;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.DisposableBean;
 import org.springframework.beans.factory.InitializingBean;

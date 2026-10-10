@@ -1,7 +1,8 @@
-package com.rtb.bid;
+package com.rtb.mapper;
 
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
+import com.rtb.entity.BidLog;
 
 /**
  * 竞价明细 Mapper。

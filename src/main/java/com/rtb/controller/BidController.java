@@ -1,4 +1,4 @@
-package com.rtb.bid;
+package com.rtb.controller;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -6,6 +6,8 @@ import org.springframework.web.bind.annotation.*;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
+import com.rtb.dto.BidRequest;
+import com.rtb.service.BidService;
 
 /**
  * 竞价接口。

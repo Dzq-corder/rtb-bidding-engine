@@ -1,10 +1,11 @@
-package com.rtb.counter;
+package com.rtb.mq;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Component;
+import com.rtb.dto.BidEvent;
 
 /**
  * 竞价事件发布者（M6 旁路）。

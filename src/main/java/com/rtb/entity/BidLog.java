@@ -1,4 +1,4 @@
-package com.rtb.bid;
+package com.rtb.entity;
 
 import lombok.Data;
 

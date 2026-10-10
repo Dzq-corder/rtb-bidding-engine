@@ -1,4 +1,4 @@
-package com.rtb.ad;
+package com.rtb.entity;
 
 import lombok.Data;
 

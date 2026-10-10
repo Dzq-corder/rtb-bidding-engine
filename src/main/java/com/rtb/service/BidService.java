@@ -1,13 +1,13 @@
-package com.rtb.bid;
+package com.rtb.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.rtb.ad.Ad;
-import com.rtb.ad.AdMapper;
-import com.rtb.budget.BudgetService;
-import com.rtb.counter.BidEvent;
-import com.rtb.counter.BidEventPublisher;
-import com.rtb.detail.BidDetailBuffer;
-import com.rtb.resilience.CircuitBreaker;
+import com.rtb.entity.Ad;
+import com.rtb.mapper.AdMapper;
+import com.rtb.service.BudgetService;
+import com.rtb.dto.BidEvent;
+import com.rtb.mq.BidEventPublisher;
+import com.rtb.service.BidDetailBuffer;
+import com.rtb.common.CircuitBreaker;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -25,6 +25,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Supplier;
+import com.rtb.dto.BidRequest;
+import com.rtb.entity.BidLog;
+import com.rtb.common.TargetingMapper;
 
 /**
  * 竞价主链路 · M1 朴素实现 + M3 预算 Lua + M4 二价 + M5 超时/熔断/兜底 + M6 事件旁路

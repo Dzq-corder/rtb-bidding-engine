@@ -1,4 +1,4 @@
-package com.rtb.counter;
+package com.rtb.consumer;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
@@ -14,6 +14,7 @@ import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import com.rtb.dto.BidEvent;
 
 /**
  * 消费组：hourly-preagg（小时级预聚合）。
