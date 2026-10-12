@@ -12,7 +12,7 @@ RTB 实时竞价广告投放引擎 · 造数脚本（M1 基线数据）
 实测（seed=42，可复现，全量约 3 分钟）：
     status        80.00% / 14.99% / 5.01%
     category      前 5 个类目占 63.4%
-    bid           P50=2.72  P90=5.01  P95=6.00  P99=8.64  max=46.02  mean=3.07
+    bid           P50=0.40  P90=0.73  P95=0.86  P99=1.18  max=2.00  mean=0.45
     daily_budget  100 元 30.2% / 500 元 28.0% / 2000 元 23.9% / 10000 元 17.9%
     bid >= 预算   违规 0 条
     广告主        2 万个，条数 max=300  P50=17  min=12
@@ -53,8 +53,9 @@ ad 表
   · advertiser_id  1~20000，广告主拥有的广告条数按 Zipf 幂律（头部约 300 条，
                    长尾 1 条）——真实投放里大广告主贡献绝大部分广告
   · category_code  20 个类目，Zipf(α=1.0)，前 5 个约占 63%
-  · bid            对数正态 lognormal(μ=ln2.7, σ=0.50)，叠加 3% 高价抢量广告，
-                   截断到 [0.10, 50.00]。实测 P50≈2.7 / P95≈6.1 / max≈45
+  · bid            对数正态 lognormal(μ=ln0.4, σ=0.465)，截断到 [0.10, 2.00]。
+                   中位数≈0.4 / P95≈0.86 / max≈2.00（真实单次曝光几分~几毛，
+                   已去掉原 45 元高价抢量极值档）
   · daily_budget   离散四档 100 / 500 / 2000 / 10000，权重 30/28/24/18
                    （想严格对齐设计说明§3.1 的四档各 25% → 改 BUDGET_TIERS）
   · status         1 在投 80% / 2 暂停 15% / 3 已耗尽 5%
@@ -117,18 +118,14 @@ MAX_ADS_PER_ADVERTISER = 300    # 单个广告主条数上限（截断后余量�
 CATEGORY_ZIPF_ALPHA = 1.0       # 1.0 时前 5 个类目约占 63%
 
 # --- 出价：对数正态 + 高价长尾 ---
-# 对齐《数据库设计说明》§3.1 实测：中位数 2.7 / P95 6.1 / max 45.14
-# 纯 lognormal 抬不出 45 这个量级（50 万样本的 max 只到 ~18），
-# 所以叠 1% 的「高价抢量」广告（金融、医美、教育这类高客单价行业）。
-# 注意：lognormal 右偏，mean 必然高于 median，本配置 mean≈3.0。
-# 文档里的「平均 2.69」与「中位数 2.7 / P95 6.1」在数学上无法同时成立，
-# 这里以两个分位数为准（分位数才是能被 SQL 复现的数字）。
-BID_LOGN_MU = math.log(2.7)     # 中位数 = e^mu = 2.7
-BID_LOGN_SIGMA = 0.465          # 使整体 P95 ≈ 6.1
-BID_HIGH_RATIO = 0.01           # 1% 高价抢量广告，抬出 45 元量级的最大值
-BID_HIGH_MU = math.log(7.4)    # 50 万样本下这 1% 的极值落在 ≈45，对齐文档实测 max
+# 真实 RTB 单次曝光出价落在几分~几毛区间，对数正态中位数 0.4 元，
+# 截断到 [0.10, 2.00]。去掉原「高价抢量」极值档（45 元量级不真实）。
+BID_LOGN_MU = math.log(0.4)     # 中位数 = e^mu = 0.4
+BID_LOGN_SIGMA = 0.465          # 整体 P95 ≈ 0.86、max 截断到 2.00
+BID_HIGH_RATIO = 0.0            # 不再叠高价抢量广告（设为 0 即关闭该分支）
+BID_HIGH_MU = math.log(7.4)     # 保留常量但已不被使用（BID_HIGH_RATIO=0）
 BID_HIGH_SIGMA = 0.50
-BID_MIN, BID_MAX = 0.10, 50.00
+BID_MIN, BID_MAX = 0.10, 2.00
 
 # --- 日预算四档 ---
 BUDGET_TIERS = [(100.0, 0.30), (500.0, 0.28), (2000.0, 0.24), (10000.0, 0.18)]
@@ -490,7 +487,7 @@ def gen_ads(rnd, n, now):
         title = prefix + rnd.choice(brands) + rnd.choice(products) + pick_suffix(rnd)
 
         budget = pick_budget(rnd)
-        # 出价：97% 主分布 + 3% 高价抢量
+        # 出价：主分布（BID_HIGH_RATIO=0 时不再叠高价抢量档）
         if rnd.random() < BID_HIGH_RATIO:
             bid = rnd.lognormvariate(BID_HIGH_MU, BID_HIGH_SIGMA)
         else:
@@ -714,7 +711,7 @@ def self_test(ads, geo, total_rows, dim_cnt, inv, rnd, scale, quick):
     print("  bid               P50=%.2f P90=%.2f P95=%.2f P99=%.2f max=%.2f mean=%.2f" % (
         pct(bids, 0.50), pct(bids, 0.90), pct(bids, 0.95), pct(bids, 0.99),
         bids[-1], sum(bids) / n))
-    print("                    (目标：P50≈2.7 / P95≈6.1 / max≈45)")
+    print("                    (目标：P50≈0.4 / P95≈0.86 / max≈2.00)")
 
     bb = defaultdict(int)
     for a in ads:

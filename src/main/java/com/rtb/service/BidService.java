@@ -131,10 +131,15 @@ public class BidService {
      * M6 下每个出口在 return 前都会异步发布一条竞价事件（旁路，不影响返回）。
      */
     public BidRequest.Result bid(BidRequest req) {
+        // 本次竞价请求的全局唯一 ID，用于日志追踪、数据对账与 Kafka 事件关联
         String requestId = UUID.randomUUID().toString().replace("-", "");
+        // 链路起点（纳秒），后续各阶段耗时都以它为基准计算
         long startNanos = System.nanoTime();
+        // 总超时截止时刻（纳秒）= 起点 + 总超时预算；后续子调用通过 withTimeout 在 deadline 内限时，防止越 SLA
         long deadline = startNanos + totalTimeoutMs * 1_000_000L;
+        // 候选检索阶段耗时（ms），初始 0，检索完成后回填，用于埋点与对账
         int candidateCostMs = 0;
+        // 计费（Redis 预算扣减）阶段耗时（ms），初始 0，扣减完成后回填，用于埋点与对账
         int billCostMs = 0;
 
         // 强制兜底（演示/复现开关）：直接返回兜底广告，模拟依赖全面故障
@@ -147,13 +152,18 @@ public class BidService {
         // ---------------------------------------------------------
         // ① 候选检索（套熔断 + 超时）。ORDER BY a.bid DESC 已把出价排序下推到 SQL。
         // ---------------------------------------------------------
+        // 候选检索阶段起点（纳秒），用于计算该阶段耗时
         long cStart = System.nanoTime();
+        // 调用候选检索：DB 熔断在内部判断，按 deadline 限时；返回 null 表示熔断 OPEN / 超时 / 异常
         List<Ad> candidates = retrieveCandidates(req, deadline);
+        // 回填候选检索耗时（ms），供埋点与对账使用
         candidateCostMs = ms(cStart, System.nanoTime());
         if (candidates == null) {
-            // 熔断 OPEN / 超时 / 异常 → 兜底，绝不返回空
+            // 候选检索失败（DB 熔断 OPEN / 超时 / 异常）→ 兜底，绝不返回空结果
             BidRequest.Result r = buildFallback(requestId);
+            // 发布一条兜底竞价事件（旁路），并带上已统计的候选检索耗时
             emit(requestId, req, r, ms(startNanos, System.nanoTime()), candidateCostMs, 0);
+            // 直接返回兜底结果，结束本次竞价
             return r;
         }
 

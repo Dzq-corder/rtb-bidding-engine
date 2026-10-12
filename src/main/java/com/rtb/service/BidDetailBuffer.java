@@ -118,29 +118,62 @@ public class BidDetailBuffer implements InitializingBean, DisposableBean {
         return flushed.get();
     }
 
+    /**
+     * 后台刷盘线程主循环（Design B：攒批上限 + 停留预算 linger）。
+     * 取到第一条后进入「攒批窗口」：尽量凑满 BATCH_SIZE 条，但自第一条起总停留不超过 FLUSH_MS，
+     * 二者先到者触发 flush。高流量下每批打满 500（fsync 摊到最薄），低流量下明细最多延迟 FLUSH_MS 即落库。
+     */
     private void loop() {
-        while (running) {
-            try {
-                // 阻塞等待下一条，最多 FLUSH_MS；超时说明没攒满也要刷一次
-                BidLog head = queue.poll(FLUSH_MS, TimeUnit.MILLISECONDS);
-                if (head == null) {
-                    drainUpTo(BATCH_SIZE);
+        List<BidLog> batch = new ArrayList<>(BATCH_SIZE);    // 复用的批次容器，避免每轮 new
+        while (running) {                                   // 未收到停止信号就持续循环
+            try {                                           // 包住循环体，单批异常不让线程退出
+                // 1) 空闲等待第一条：最多 FLUSH_MS 没数据则刷残余并继续等（空闲心跳）
+                BidLog first = queue.poll(FLUSH_MS, TimeUnit.MILLISECONDS);
+                if (first == null) {                        // 空闲超时：队列空了 FLUSH_MS
+                    if (!batch.isEmpty()) {                 // 防御性：把上一轮残留（正常不会进这里）刷掉
+                        flush(batch);
+                        batch.clear();
+                    }
+                    continue;                               // 回到循环开头继续等第一条
+                }
+                batch.add(first);                           // 第一条入批，攒批窗口启动
+
+                // 2) 先把当前队列里立即可用的尽量捞过来（突发流量下直接凑满 500）
+                queue.drainTo(batch, BATCH_SIZE - batch.size());
+                if (batch.size() >= BATCH_SIZE) {           // 已打满上限，无需再等
+                    flush(batch);
+                    batch.clear();
                     continue;
                 }
-                List<BidLog> batch = new ArrayList<>(BATCH_SIZE);
-                batch.add(head);
-                queue.drainTo(batch, BATCH_SIZE - 1);   // 再凑一批，最多补到 BATCH_SIZE-1
-                flush(batch);
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                break;
-            } catch (Exception e) {
-                log.error("bid-detail-flusher 异常: {}", e.getMessage());
+
+                // 3) 没满：进入 linger 窗口，在剩余预算内继续等数据顶满批次。
+                //    以 FLUSH_MS 作为「自第一条起算」的总停留预算，而非每条都等 FLUSH_MS
+                //    （否则低流量会无限拖延——每来一条就把等待再续 200ms）。
+                long deadline = System.nanoTime() + FLUSH_MS * 1_000_000L;
+                while (batch.size() < BATCH_SIZE) {         // 还没凑满就继续等
+                    long remain = deadline - System.nanoTime();
+                    if (remain <= 0) break;                 // 停留预算耗尽，带着当前这批走
+                    BidLog next = queue.poll(remain, TimeUnit.NANOSECONDS);
+                    if (next == null) break;                // 预算内再无数据，停止攒批
+                    batch.add(next);
+                }
+                flush(batch);                               // 满 500 或预算耗尽 → 批量落库
+                batch.clear();
+            } catch (InterruptedException ie) {             // 捕获中断（destroy 调了 flusher.interrupt()）
+                Thread.currentThread().interrupt();         // 重设中断标志，遵守 Java 中断语义
+                break;                                      // 跳出 while(running)，进入退出前残余刷盘
+            } catch (Exception e) {                         // 捕获其他任何异常（如写库失败）
+                log.error("bid-detail-flusher 异常: {}", e.getMessage()); // 仅记日志，不退出循环
+                batch.clear();                              // 本批清空，避免坏数据反复刷导致卡死
             }
         }
         // 线程退出（running=false 或被中断）：把残余明细全部刷完
-        while (!queue.isEmpty()) {
-            drainUpTo(BATCH_SIZE);
+        if (!batch.isEmpty()) {                             // 循环内最后一次可能还攒着一批
+            flush(batch);
+            batch.clear();
+        }
+        while (!queue.isEmpty()) {                          // 队列里仍有的没刷的明细
+            drainUpTo(BATCH_SIZE);                          // 分批全部刷完，关闭时不丢缓冲尾数据
         }
     }
 
