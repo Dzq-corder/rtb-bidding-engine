@@ -1,14 +1,20 @@
 package com.rtb.service;
 
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.RedisOperations;
+import org.springframework.data.redis.core.SessionCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.ValueOperations;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Service;
 
+import com.rtb.entity.Ad;
 import com.rtb.mapper.AdMapper;
 
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.Arrays;
@@ -64,13 +70,21 @@ public class BudgetService {
     private final StringRedisTemplate redis;
     private final AdMapper adMapper;
 
+    /** 预热播种时给 key 设置的存活时长（秒），默认 2 天；与 BudgetKeyCleaner 的保留窗口互为兜底 */
+    @Value("${rtb.budget.key-ttl-seconds:172800}")
+    private long keyTtlSeconds;
+
     public BudgetService(StringRedisTemplate redis, AdMapper adMapper) {
         this.redis = redis;
         this.adMapper = adMapper;
     }
 
     private String budgetKey(Long adId) {
-        return "budget:" + adId + ":" + LocalDate.now().format(DATE_FMT);
+        return budgetKey(adId, LocalDate.now().format(DATE_FMT));
+    }
+
+    private String budgetKey(Long adId, String date) {
+        return "budget:" + adId + ":" + date;
     }
 
     private String spentKey(Long adId) {
@@ -116,6 +130,42 @@ public class BudgetService {
             }
         }
         return ok;
+    }
+
+    /**
+     * 检索阶段批量预热：为本次候选惰性补建 Redis 预算 key，把「初始化写」从计费热路径
+     * （Lua {@code deduct} 里的播种）提前挪到检索侧。
+     *
+     * <p>用 {@code SET NX}（{@code setIfAbsent}）——<b>只在 key 不存在时播种</b>，绝不覆盖当天
+     * 已消耗的预算；同时带上 {@code keyTtlSeconds} 过期，与 {@link BudgetKeyCleaner} 的定时清理
+     * 互为兜底（一个被动过期、一个主动扫尾）。
+     *
+     * <p>{@code spent} 无需在此播种：判断只看 {@code budget} key，{@code spent} 由扣减时的
+     * {@code INCRBY} 按缺省 0 自动创建。
+     *
+     * <p>失败可容忍：预热失败时计费阶段的 Lua 仍会惰性播种，不影响正确性，故由调用方包 try-catch。
+     */
+    public void warmBudgets(List<Ad> candidates) {
+        if (candidates == null || candidates.isEmpty()) {
+            return;
+        }
+        String date = LocalDate.now().format(DATE_FMT);
+        Duration ttl = Duration.ofSeconds(keyTtlSeconds);
+        redis.executePipelined(new SessionCallback<Object>() {
+            @Override
+            @SuppressWarnings({"rawtypes", "unchecked"})
+            public Object execute(RedisOperations operations) {
+                ValueOperations<String, String> ops = operations.opsForValue();
+                for (Ad ad : candidates) {
+                    if (ad == null || ad.getId() == null || ad.getDailyBudget() == null) {
+                        continue;   // 防御：字段缺失的候选跳过，交给计费时惰性兜底
+                    }
+                    ops.setIfAbsent(budgetKey(ad.getId(), date),
+                            String.valueOf(toCents(ad.getDailyBudget())), ttl);
+                }
+                return null;
+            }
+        });
     }
 
     /** 金额统一以「分」为单位存进 Redis，避免 double 的浮点误差 */

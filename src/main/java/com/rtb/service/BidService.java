@@ -179,6 +179,14 @@ public class BidService {
             return r;
         }
 
+        // 检索阶段预算预热：为本次候选惰性补建 Redis 预算 key（SET NX + 2 天过期），
+        // 把「初始化写」从计费热路径挪到检索侧。best-effort：失败忽略，计费时 Lua 会惰性兜底。
+        try {
+            budgetService.warmBudgets(matched);
+        } catch (Exception e) {
+            log.warn("预算预热失败（忽略，计费时惰性兜底）requestId={}: {}", requestId, e.getMessage());
+        }
+
         // ---------------------------------------------------------
         // ③ 二价计费（Vickrey）+ fall-through
         //    候选已按出价降序（SQL ORDER BY a.bid DESC）。

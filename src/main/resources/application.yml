@@ -128,3 +128,13 @@ rtb:
   kafka:
     topic: bid_event
     partitions: 3
+  budget:
+    # 检索阶段预热的播种 key 存活时长（秒），默认 2 天；与 cleanup 的保留窗口互为兜底
+    key-ttl-seconds: 172800
+    cleanup:
+      # 预算 key（budget:/spent:）按天分桶，写入未设 TTL，需定时清理旧日期 bucket，
+      # 否则 Redis noeviction 被打满后写被拒 → 预算扣减失败。
+      # 保留天数：保留「今天」往前共 N 天，清理更早的日期分桶（默认 2 = 保留今天+昨天，清掉前天及更早）
+      retention-days: 2
+      # 清理触发时间（cron：秒 分 时 日 月 周），默认每天 01:00
+      cron: "0 0 1 * * ?"
