@@ -5,6 +5,8 @@
 !/sql/
 !/src/
 !/tools/
+# .github 必须放行，否则 CI workflow（ci.yml）推不上 GitHub、永不触发
+!/.github/
 
 # 编译产物：必须忽略。旧配置里写成 !/target/ 把 .class 全部放行进了仓库
 /target/
