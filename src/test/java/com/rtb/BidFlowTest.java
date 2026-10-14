@@ -92,6 +92,45 @@ class BidFlowTest {
         awaitRowsByAdId("ad_freq", "freq-antifraud");
     }
 
+    /**
+     * 入参校验 + 全局异常处理：缺少必填的 slotCode 时，请求在进 Service 之前就被拦下，
+     * 由 {@code GlobalExceptionHandler} 返回 400 且响应体仍是统一结构（code=400、msg 含字段名）。
+     */
+    @Test
+    void bid_missingSlotCode_returns400WithUnifiedBody() throws Exception {
+        mockMvc.perform(post("/bid")
+                        .contentType("application/json")
+                        .content("{\"region\":\"440318\",\"age\":28}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value(400))
+                .andExpect(jsonPath("$.msg").value(org.hamcrest.Matchers.containsString("slotCode")));
+    }
+
+    /**
+     * 入参越界：age 超出 0~120 时同样被 {@code @Min/@Max} 拦下返回 400。
+     */
+    @Test
+    void bid_ageOutOfRange_returns400() throws Exception {
+        mockMvc.perform(post("/bid")
+                        .contentType("application/json")
+                        .content("{\"region\":\"440318\",\"slotCode\":\"test-slot\",\"age\":999}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value(400))
+                .andExpect(jsonPath("$.msg").value(org.hamcrest.Matchers.containsString("age")));
+    }
+
+    /**
+     * 请求体不可读（非法 JSON）：由 {@code HttpMessageNotReadableException} 分支兜住，返回 400 而非 500。
+     */
+    @Test
+    void bid_malformedJson_returns400() throws Exception {
+        mockMvc.perform(post("/bid")
+                        .contentType("application/json")
+                        .content("{\"region\":\"440318\","))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value(400));
+    }
+
     /** 轮询等待指定消费组把本轮事件（ad_id=900002）落库；超时则失败并指出是哪个组。 */
     private void awaitRowsByAdId(String table, String group) throws InterruptedException {
         String sql = "SELECT COUNT(*) FROM " + table + " WHERE ad_id = 900002";

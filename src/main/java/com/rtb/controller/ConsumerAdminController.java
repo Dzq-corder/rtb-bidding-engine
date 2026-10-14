@@ -13,6 +13,8 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import com.rtb.common.ApiResponse;
+
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -48,19 +50,19 @@ public class ConsumerAdminController {
     }
 
     @PostMapping("/consumer/pause")
-    public Map<String, String> pause() {
+    public ApiResponse<Map<String, String>> pause() {
         registry.getAllListenerContainers().forEach(c -> c.pause());
-        return Map.of("status", "paused");
+        return ApiResponse.ok(Map.of("status", "paused"));
     }
 
     @PostMapping("/consumer/resume")
-    public Map<String, String> resume() {
+    public ApiResponse<Map<String, String>> resume() {
         registry.getAllListenerContainers().forEach(c -> c.resume());
-        return Map.of("status", "resumed");
+        return ApiResponse.ok(Map.of("status", "resumed"));
     }
 
     @GetMapping("/kafka/lag")
-    public List<Map<String, Object>> lag(@RequestParam String group) throws InterruptedException, ExecutionException {
+    public ApiResponse<List<Map<String, Object>>> lag(@RequestParam String group) throws InterruptedException, ExecutionException {
         Properties props = new Properties();
         props.put("bootstrap.servers", bootstrap);
         try (AdminClient admin = AdminClient.create(props)) {
@@ -84,7 +86,7 @@ public class ConsumerAdminController {
                 row.put("lag", endOff - committedOff);
                 out.add(row);
             }
-            return out;
+            return ApiResponse.ok(out);
         }
     }
 }

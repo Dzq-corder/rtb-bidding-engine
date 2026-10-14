@@ -29,6 +29,12 @@
       <artifactId>spring-boot-starter-web</artifactId>
     </dependency>
 
+    <!-- Bean Validation：@Valid 入参校验（Spring Boot 3 起 Web starter 不再自带） -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-validation</artifactId>
+    </dependency>
+
     <!-- Actuator：健康检查与 P99 埋点指标出口 -->
     <dependency>
       <groupId>org.springframework.boot</groupId>

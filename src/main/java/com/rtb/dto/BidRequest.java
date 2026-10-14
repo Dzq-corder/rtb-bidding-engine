@@ -1,5 +1,8 @@
 package com.rtb.dto;
 
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
+import jakarta.validation.constraints.NotBlank;
 import lombok.Data;
 
 import java.util.List;
@@ -11,18 +14,24 @@ import java.util.List;
 public class BidRequest {
 
     /** 广告位编码 */
+    @NotBlank(message = "不能为空")
     private String slotCode;
 
     /** 地域编码，如 110000 */
+    @NotBlank(message = "不能为空")
     private String region;
 
     /**
      * 年龄段，映射到 ad_target.dim_type=2 的取值。
      * 传原始年龄（如 28）由服务端换算成 25-30，避免调用方各写一套映射。
      */
+    @Min(value = 0, message = "应在 0~120 之间")
+    @Max(value = 120, message = "应在 0~120 之间")
     private Integer age;
 
     /** 1 男 2 女 0 未知 */
+    @Min(value = 0, message = "只能为 0/1/2")
+    @Max(value = 2, message = "只能为 0/1/2")
     private Integer gender;
 
     /** 年龄段，直接传 ad_target 的原值时优先于此字段 */
