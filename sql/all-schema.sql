@@ -15,6 +15,13 @@
 --   本文件以「与消费代码匹配」的版本为准，去重后共 7 张唯一表。
 --   旧的三个分散文件（schema.sql / m1_indexes.sql / m6-counter-schema.sql）
 --   初始化时不要再单独执行，只用本文件。
+--
+-- 存量库升级（本文件含 DROP TABLE，不能直接跑在已有数据的库上）：
+--   后续新增的两个「管理端索引」用在线 DDL 添加，不阻塞读写：
+--     ALTER TABLE ad        ADD KEY idx_adv (advertiser_id),
+--                           ALGORITHM=INPLACE, LOCK=NONE;
+--     ALTER TABLE ad_target ADD KEY idx_ad_dir (ad_id, dim_type, dim_value),
+--                           ALGORITHM=INPLACE, LOCK=NONE;
 -- =====================================================================
 
 CREATE DATABASE IF NOT EXISTS rtb
@@ -28,6 +35,12 @@ USE rtb;
 --    bid           DECIMAL(10,4) 单次展示出价（元）
 --    daily_budget  DECIMAL(12,2) 日预算，离散档位
 --    status        1在投 2暂停 3已耗尽（检索阶段需状态过滤）
+--
+--    idx_adv(advertiser_id) ——【管理端索引】服务 /admin/ad 的列表查询
+--      （WHERE advertiser_id = ? ORDER BY id DESC）。
+--      它不参与竞价检索，因此不改动 M1 baseline 下「ad 走主键 eq_ref」
+--      的执行计划结论——「ad 不建索引」这条基线说的是检索路径。
+--      借 InnoDB 二级索引隐含主键的特性，该索引可直接反向扫描满足倒序分页。
 -- ---------------------------------------------------------------------
 DROP TABLE IF EXISTS ad;
 CREATE TABLE ad (
@@ -41,16 +54,25 @@ CREATE TABLE ad (
   status        TINYINT         NOT NULL DEFAULT 1 COMMENT '1在投 2暂停 3已耗尽',
   created_at    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '修改时间',
-  PRIMARY KEY (id)
+  PRIMARY KEY (id),
+  KEY idx_adv (advertiser_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='在投广告';
 
 -- ---------------------------------------------------------------------
 -- 2. ad_target · 定向条件倒排（500 万行）
 --    dim_type: 1地域 2年龄段 3性别 4兴趣 5系统 6设备
---    M1 即在 ad_target 上建 idx_dim_lookup，承担「筛得准」；ad 表不加索引（承担「慢」，全表扫描基线）
---    联合索引 (dim_type, dim_value, ad_id)：
+--    M1 即在 ad_target 上建 idx_dim_lookup，承担「筛得准」；而 ad 表不建
+--    「检索路径相关」的索引（承担「慢」，全表扫描基线）——
+--    ad 上的 idx_adv 只服务管理后台查询，与检索路径无关，不违背该结论。
+--
+--    ① 倒排索引 (dim_type, dim_value, ad_id)：条件 → 广告（竞价检索用）
 --      dim_type + dim_value 是定向倒排的两个条件列（等值前缀定位候选）
 --      ad_id 是倒排指向的广告 ID，供 JOIN / 回表使用（覆盖索引）
+--
+--    ② 正排索引 (ad_id, dim_type, dim_value)：广告 → 条件（管理后台用）
+--      ad_id 必须在最左，才能支持 WHERE ad_id = ?（最左前缀原则；
+--      倒排索引里 ad_id 是第三列，单独用它走不了索引 → 只能全表扫 644 万行）
+--      三列同时覆盖 SELECT dim_type, dim_value，查询无需回表
 -- ---------------------------------------------------------------------
 DROP TABLE IF EXISTS ad_target;
 CREATE TABLE ad_target (
@@ -59,7 +81,8 @@ CREATE TABLE ad_target (
   dim_type  TINYINT         NOT NULL COMMENT '1地域 2年龄段 3性别 4兴趣 5系统 6设备',
   dim_value VARCHAR(64)     NOT NULL COMMENT '定向值，如 110000 / 25-30 / male / 数码科技',
   PRIMARY KEY (id),
-  KEY idx_dim_lookup (dim_type, dim_value, ad_id)
+  KEY idx_dim_lookup (dim_type, dim_value, ad_id),
+  KEY idx_ad_dir (ad_id, dim_type, dim_value)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='定向条件倒排';
 
 -- ---------------------------------------------------------------------

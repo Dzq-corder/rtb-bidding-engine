@@ -70,4 +70,106 @@
     GROUP BY t.dim_value
   </select>
 
+  <!-- =====================================================================
+       管理端 CRUD（/admin/ad）
+       =====================================================================
+       与上面的检索路径隔离，不参与竞价，不改变 findCandidates 的执行计划。
+
+       性能提示（索引未补前）：
+         · countBy / selectPage 按 advertiser_id 过滤 → ad 全表扫 + filesort
+         · listTargetsByAdId / deleteTargetsByAdId 按 ad_id 过滤 → ad_target 全表扫
+       补索引后 selectPage 可直接借 (advertiser_id) 二级索引的隐含主键反向扫描，
+       无需额外排序。
+
+       LIKE 说明：用 CONCAT + #{} 参数化，无注入风险；但用户输入里的 % 与 _
+       仍会被当作通配符（语义偏差，非安全问题），管理端搜索场景可接受。
+       ===================================================================== -->
+
+  <sql id="adFilter">
+    <where>
+      <if test="q.advertiserId != null">
+        AND advertiser_id = #{q.advertiserId}
+      </if>
+      <if test="q.status != null">
+        AND status = #{q.status}
+      </if>
+      <if test="q.titleLike != null and q.titleLike != ''">
+        AND title LIKE CONCAT('%', #{q.titleLike}, '%')
+      </if>
+    </where>
+  </sql>
+
+  <select id="selectById" resultType="com.rtb.entity.Ad">
+    SELECT id, advertiser_id, title, creative_url, category_code,
+           bid, daily_budget, status, created_at, updated_at
+    FROM ad
+    WHERE id = #{id}
+  </select>
+
+  <select id="countBy" resultType="long">
+    SELECT COUNT(*) FROM ad
+    <include refid="adFilter"/>
+  </select>
+
+  <select id="selectPage" resultType="com.rtb.entity.Ad">
+    SELECT id, advertiser_id, title, creative_url, category_code,
+           bid, daily_budget, status, created_at, updated_at
+    FROM ad
+    <include refid="adFilter"/>
+    ORDER BY id DESC
+    LIMIT #{q.limit} OFFSET #{q.offset}
+  </select>
+
+  <!-- 自增主键回填到 ad.id，service 拿到后直接用于写 ad_target -->
+  <insert id="insertAd" parameterType="com.rtb.entity.Ad"
+          useGeneratedKeys="true" keyProperty="id">
+    INSERT INTO ad (advertiser_id, title, creative_url, category_code, bid, daily_budget, status)
+    VALUES (#{advertiserId}, #{title}, #{creativeUrl}, #{categoryCode}, #{bid}, #{dailyBudget}, #{status})
+  </insert>
+
+  <!-- 局部更新：null 字段不参与 SET；updated_at 由 DB 的 ON UPDATE 维护 -->
+  <update id="updateAd" parameterType="com.rtb.entity.Ad">
+    UPDATE ad
+    <set>
+      <if test="title != null">title = #{title},</if>
+      <if test="creativeUrl != null">creative_url = #{creativeUrl},</if>
+      <if test="categoryCode != null">category_code = #{categoryCode},</if>
+      <if test="bid != null">bid = #{bid},</if>
+      <if test="dailyBudget != null">daily_budget = #{dailyBudget},</if>
+      <if test="status != null">status = #{status},</if>
+    </set>
+    WHERE id = #{id}
+  </update>
+
+  <delete id="deleteAd">
+    DELETE FROM ad WHERE id = #{id}
+  </delete>
+
+  <!-- 目标状态只接受 1(在投)/2(暂停)，由 service 层校验。
+       这里不加 status IN (1,2) 的过滤：也为「把系统标记的 3(已耗尽) 改回 1」留出通路。
+       但仅改状态不足以恢复投放——Redis 的 spent 计数仍为满，下一轮扣减会立刻重新标记为 3。 -->
+  <update id="updateStatus">
+    UPDATE ad SET status = #{status}
+    WHERE id = #{id}
+  </update>
+
+  <select id="listTargetsByAdId" resultType="java.util.LinkedHashMap">
+    SELECT dim_type AS dimType, dim_value AS dimValue
+    FROM ad_target
+    WHERE ad_id = #{adId}
+    ORDER BY dim_type, dim_value
+  </select>
+
+  <!-- 单条 INSERT 拼多组 VALUES，避免 N 次网络往返 -->
+  <insert id="batchInsertTargets">
+    INSERT INTO ad_target (ad_id, dim_type, dim_value) VALUES
+    <foreach collection="targets" item="t" separator=",">
+      (#{adId}, #{t.dimType}, #{t.dimValue})
+    </foreach>
+  </insert>
+
+  <delete id="deleteTargetsByAdId">
+    DELETE FROM ad_target WHERE ad_id = #{adId}
+  </delete>
+
 </mapper>

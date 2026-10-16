@@ -7,6 +7,8 @@ import org.apache.ibatis.annotations.Update;
 import java.util.List;
 import java.util.Map;
 import com.rtb.entity.Ad;
+import com.rtb.dto.AdQuery;
+import com.rtb.dto.TargetItem;
 import com.rtb.service.BudgetService;
 /**
  * 广告 Mapper。
@@ -75,4 +77,52 @@ public interface AdMapper {
      */
     @Update("UPDATE ad SET status = 3 WHERE id = #{id} AND status = 1")
     int markExhausted(@Param("id") Long id);
+
+    // =====================================================================
+    // 管理端 CRUD（服务 /admin/ad 这批接口）
+    //
+    // 与上面的检索路径完全隔离：这些 SQL 不参与竞价，因此不会改变
+    // findCandidates 的执行计划，也不影响 M1 baseline 的结论。
+    //
+    // 【已知代价】ad 表除主键外无索引（M1 刻意设计）、ad_target 只有
+    // (dim_type, dim_value, ad_id) 联合索引（最左前缀用不上 ad_id），因此：
+    //   · countBy / selectPage  按 advertiser_id 查 → 全表扫 + filesort
+    //   · listTargetsByAdId / deleteTargetsByAdId  按 ad_id 查 → 全表扫 644 万行
+    // 索引留待后续单独补（建议 KEY idx_adv(advertiser_id) 与
+    // KEY idx_ad_dir(ad_id, dim_type)），补完需重新 EXPLAIN 复核检索计划未变。
+    // =====================================================================
+
+    /** 按主键查广告，不存在返回 null */
+    Ad selectById(@Param("id") Long id);
+
+    /** 列表总数，筛选条件与 selectPage 完全一致，保证 total 与当页数据同源 */
+    long countBy(@Param("q") AdQuery q);
+
+    /** 列表分页查询（ORDER BY id DESC，最新的在前） */
+    List<Ad> selectPage(@Param("q") AdQuery q);
+
+    /** 新建广告，回填自增主键到 {@code ad.id} */
+    int insertAd(Ad ad);
+
+    /** 按主键更新可变字段（null 字段不更新，即局部更新） */
+    int updateAd(Ad ad);
+
+    /** 按主键删除广告本体 */
+    int deleteAd(@Param("id") Long id);
+
+    /**
+     * 变更投放状态。目标状态只允许 1(在投)/2(暂停)，由 service 层校验。
+     * 也允许把系统标记的 3(已耗尽) 改回 1，但**仅改状态不足以恢复投放**——
+     * Redis 的 spent 计数仍为满，下一轮扣减会立刻把它重新标记为 3，需配合预算重置。
+     */
+    int updateStatus(@Param("id") Long id, @Param("status") Integer status);
+
+    /** 查某广告的全部定向条件，供详情页展示 */
+    List<Map<String, Object>> listTargetsByAdId(@Param("adId") Long adId);
+
+    /** 批量写入定向条件（单条 INSERT 拼多组 VALUES） */
+    int batchInsertTargets(@Param("adId") Long adId, @Param("targets") List<TargetItem> targets);
+
+    /** 清空某广告的定向条件（更新时「全删重插」的第一步） */
+    int deleteTargetsByAdId(@Param("adId") Long adId);
 }
