@@ -14,7 +14,14 @@ spring:
 
   datasource:
     # 本地演示环境不设密码，对应 docker-compose.yml 的 MYSQL_ALLOW_EMPTY_PASSWORD
-    url: jdbc:mysql://127.0.0.1:3306/rtb?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&rewriteBatchedStatements=true
+    #
+    # socketTimeout=3000：网络层保险丝。MySQL 驱动默认 0（无限等），一旦网络丢包/连接
+    #   卡死，客户端会一直挂在 read 上——此时 MAX_EXECUTION_TIME 帮不了（SQL 没到服务端），
+    #   MyBatis timeout 的取消也要另开连接发 KILL QUERY，同样发不出去。
+    #   语义是「两次网络读之间的静默上限」，对非流式查询等同于语句总时长上限。
+    #   取 3000 与 hikari.connection-timeout 对齐；比它更小的值会误伤后台报表/批量写。
+    # connectTimeout=3000：建连阶段的 TCP 超时（默认 0 时，对端丢包会等到系统默认 20s+）。
+    url: jdbc:mysql://127.0.0.1:3306/rtb?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&rewriteBatchedStatements=true&socketTimeout=3000&connectTimeout=3000
     username: root
     password:
     driver-class-name: com.mysql.cj.jdbc.Driver
