@@ -19,12 +19,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
-import java.util.function.Supplier;
 import com.rtb.dto.BidRequest;
 import com.rtb.entity.BidLog;
 import com.rtb.common.TargetingMapper;
@@ -36,8 +30,10 @@ import com.rtb.common.TargetingMapper;
  *
  * <p><b>本轮（M5）新增的韧性机制</b>：
  * <ul>
- *   <li><b>超时预算</b>：入链定 {@code deadline = now + total-ms}，各跳受子预算约束，
- *       超期即放弃后续步骤、直接兜底，保证整条链路不越过 SLA。</li>
+ *   <li><b>超时预算</b>：入链定 {@code deadline = now + total-ms}，计费循环内超期即放弃后续候选、
+ *       直接兜底。<b>M9 起链路内不再有应用级线程池</b>：DB 超时由 MySQL 优化器 hint
+ *       {@code MAX_EXECUTION_TIME(800)}（服务端毫秒级）+ MyBatis {@code timeout="1"} 兜住；
+ *       Redis 超时由 Lettuce 的 {@code spring.data.redis.timeout(200ms)} 兜住。</li>
  *   <li><b>熔断</b>：DB 检索与 Redis 计费各持独立熔断器；
  *       连续失败超阈值 → OPEN（后续请求短路兜底），冷却后 HALF_OPEN 放一个探活，成功自愈。</li>
  *   <li><b>兜底广告</b>：任何失败（超时 / 熔断 OPEN / 候选为空 / 预算耗尽）一律返回 Redis 中的
@@ -67,17 +63,12 @@ public class BidService {
     @Value("${rtb.min-increment:0.01}")
     private BigDecimal minIncrement;
 
-    /** M5：整条链路总超时预算（ms），SLA 闸门 */
+    /**
+     * M5：整条链路总超时预算（ms），SLA 闸门。
+     * M9 去线程池后仅用于计费循环的阶段截止判断（{@code now > deadline} 即放弃后续候选）。
+     */
     @Value("${rtb.timeout.total-ms:1000}")
     private long totalTimeoutMs;
-
-    /** M5：DB 候选检索子预算（ms） */
-    @Value("${rtb.timeout.db-ms:800}")
-    private long dbTimeoutMs;
-
-    /** M5：Redis 计费子预算（ms） */
-    @Value("${rtb.timeout.redis-ms:200}")
-    private long redisTimeoutMs;
 
     /** M5：强制兜底开关，用于演示/复现「依赖全面故障」场景 */
     @Value("${rtb.fallback.force:false}")
@@ -90,10 +81,6 @@ public class BidService {
      */
     @Value("${rtb.fallback.enabled:true}")
     private boolean fallbackEnabled;
-
-    /** M5：超时包裹用的有界线程池（仅阻塞式 DB/Redis 调用需要），避免 servlet 线程被长阻塞拖死 */
-    private final ExecutorService timeoutPool =
-            Executors.newFixedThreadPool(Math.max(16, Runtime.getRuntime().availableProcessors() * 4));
 
     /** M5：DB 与 Redis 各自独立熔断器，互不影响 */
     private final CircuitBreaker dbBreaker;
@@ -135,7 +122,7 @@ public class BidService {
         String requestId = UUID.randomUUID().toString().replace("-", "");
         // 链路起点（纳秒），后续各阶段耗时都以它为基准计算
         long startNanos = System.nanoTime();
-        // 总超时截止时刻（纳秒）= 起点 + 总超时预算；后续子调用通过 withTimeout 在 deadline 内限时，防止越 SLA
+        // 总超时截止时刻（纳秒）= 起点 + 总超时预算；计费循环在 deadline 内推进，超期即兜底，防止越 SLA
         long deadline = startNanos + totalTimeoutMs * 1_000_000L;
         // 候选检索阶段耗时（ms），初始 0，检索完成后回填，用于埋点与对账
         int candidateCostMs = 0;
@@ -150,12 +137,12 @@ public class BidService {
         }
 
         // ---------------------------------------------------------
-        // ① 候选检索（套熔断 + 超时）。ORDER BY a.bid DESC 已把出价排序下推到 SQL。
+        // ① 候选检索（套熔断，超时下沉到 SQL 层）。ORDER BY a.bid DESC 已把出价排序下推到 SQL。
         // ---------------------------------------------------------
         // 候选检索阶段起点（纳秒），用于计算该阶段耗时
         long cStart = System.nanoTime();
-        // 调用候选检索：DB 熔断在内部判断，按 deadline 限时；返回 null 表示熔断 OPEN / 超时 / 异常
-        List<Ad> candidates = retrieveCandidates(req, deadline);
+        // 调用候选检索：DB 熔断在内部判断；返回 null 表示熔断 OPEN / SQL 超时(800ms) / 异常
+        List<Ad> candidates = retrieveCandidates(req);
         // 回填候选检索耗时（ms），供埋点与对账使用
         candidateCostMs = ms(cStart, System.nanoTime());
         if (candidates == null) {
@@ -191,7 +178,7 @@ public class BidService {
         // ③ 二价计费（Vickrey）+ fall-through
         //    候选已按出价降序（SQL ORDER BY a.bid DESC）。
         //    胜出者 = 沿降序第一个预算充足的候选；成交价 = min(胜出者出价, 次高出价 + 最小加价)。
-        //    套 Redis 熔断 + 整体 deadline 约束：Redis 挂 / 预算耗尽 / 超时 → 兜底。
+        //    套 Redis 熔断 + 整体 deadline 约束：Redis 挂 / 预算耗尽 / 阶段超期 → 兜底。
         // ---------------------------------------------------------
         Ad winner = null;
         BigDecimal payPrice = null;
@@ -199,6 +186,9 @@ public class BidService {
         Integer advertiserId = null;
 
         long bStart = System.nanoTime();
+        // M7 修正：余额不足需回写 MySQL 状态的广告先收集，计费相位结束后再统一落库，
+        // 彻底脱离 Redis 超时包裹、Redis 熔断与 billCostMs（Redis 计费耗时）计时。
+        List<Long> exhaustedToMark = new ArrayList<>();
         if (redisBreaker.allowRequest()) {
             for (int i = 0; i < matched.size(); i++) {
                 // 整体超时预算耗尽 → 放弃后续计费，兜底收尾
@@ -212,14 +202,19 @@ public class BidService {
                         : candidate.getBid();               // 仅一名候选，次高=自身
                 BigDecimal price = secondBid.add(minIncrement).min(candidate.getBid());
 
-                boolean deducted;
+                boolean deducted = false;
+                boolean redisFailed = false;
                 try {
-                    // Redis 计费包一层超时，避免慢 Redis 拖垮整条链路
-                    deducted = withTimeout(() -> budgetService.deduct(
-                            candidate.getId(), candidate.getDailyBudget(), price), deadline);
+                    // M9 去线程池：同步调用。Redis 命令超时由 Lettuce 的
+                    // spring.data.redis.timeout(200ms) 在驱动层负责，到点抛 RedisCommandTimeoutException
+                    deducted = budgetService.deduct(
+                            candidate.getId(), candidate.getDailyBudget(), price);
                     redisBreaker.onSuccess();
                 } catch (Exception e) {
+                    // 仅 Lettuce 命令超时 / 连接异常才算 Redis 失败并触发熔断；
+                    // 余额不足（deduct 正常返回 false）不属于 Redis 故障，不在此分支。
                     redisBreaker.onFailure();
+                    redisFailed = true;
                     deducted = false;
                 }
                 if (deducted) {
@@ -229,10 +224,27 @@ public class BidService {
                     advertiserId = candidate.getAdvertiserId();
                     break;
                 }
+                // M7 修正（职责解耦）：仅收集「Redis 正常返回余额不足」的候选，
+                // 不在计费相位内写 MySQL（避免污染 billCostMs、受 Redis 200ms 子超时约束、
+                // 误开 Redis 熔断器）。Redis 故障（redisFailed）的候选不收集、不误标。
+                if (!redisFailed) {
+                    exhaustedToMark.add(candidate.getId());
+                }
             }
         }
 
-        billCostMs = ms(bStart, System.nanoTime());
+        billCostMs = ms(bStart, System.nanoTime());   // ← 此时仅含 Redis 扣减耗时，不含后续 MySQL 回写
+
+        // M7 修正：计费相位之外、统一回写「余额不足」广告的 MySQL 状态（ad.status=0，
+        // 使检索 SQL 的 WHERE a.status=1 在后续请求中直接排除）。已完全脱离 Redis 超时包裹、
+        // Redis 熔断器与 billCostMs 计时；失败仅告警，不影响本次竞价返回。
+        for (Long id : exhaustedToMark) {
+            try {
+                adMapper.markExhausted(id);
+            } catch (Exception ex) {
+                log.warn("标记广告已耗尽失败 adId={}: {}", id, ex.getMessage());
+            }
+        }
 
         // Redis 熔断 OPEN / 预算全部不足 / 整体超时 → 兜底广告保底
         if (winner == null) {
@@ -323,48 +335,38 @@ public class BidService {
     }
 
     /**
-     * ① 候选检索：熔断 OPEN 直接短路；否则用有界线程池包裹阻塞式 DB 调用并限时。
+     * ① 候选检索：熔断 OPEN 直接短路；否则同步调用 DB。
+     *
+     * <p><b>M9（去线程池）</b>：不再用「线程池 + {@code get(timeout)}」包裹，改同步调用，
+     * 超时下沉到 SQL 层，由两道闸门负责：
+     * <ul>
+     *   <li>MySQL 优化器 hint {@code MAX_EXECUTION_TIME(800)}：<b>服务端</b>毫秒级中断，只作用于本 SELECT；</li>
+     *   <li>MyBatis {@code timeout="1"}：<b>客户端</b>秒级保险丝（驱动强制取消）。</li>
+     * </ul>
+     * 代价：请求线程会被阻塞至多约 800ms~1s；换来的是竞价链路里没有任何应用级线程池。
      *
      * @return 候选列表；任一失败（熔断/超时/异常）返回 null，由调用方走兜底
      */
-    private List<Ad> retrieveCandidates(BidRequest req, long deadline) {
+    private List<Ad> retrieveCandidates(BidRequest req) {
         if (!dbBreaker.allowRequest()) {
             return null; // 熔断 OPEN → 兜底
         }
-        long remainingMs = (deadline - System.nanoTime()) / 1_000_000;
-        if (remainingMs <= 0) {
-            return null; // 总预算已耗尽 → 兜底
-        }
         try {
-            List<Ad> result = CompletableFuture
-                    .supplyAsync(() -> adMapper.findCandidates(
-                            req.getRegion(),
-                            TargetingMapper.resolveAgeBucket(req.getAge(), req.getAgeBucket()),
-                            TargetingMapper.toGender(req.getGender()),
-                            req.getCategoryCode()), timeoutPool)
-                    .get(Math.min(remainingMs, dbTimeoutMs), TimeUnit.MILLISECONDS);
+            // 同步调用：超时由 SQL hint(800ms) + MyBatis timeout(1s) 兜住
+            List<Ad> result = adMapper.findCandidates(
+                    req.getRegion(),
+                    TargetingMapper.resolveAgeBucket(req.getAge(), req.getAgeBucket()),
+                    TargetingMapper.toGender(req.getGender()),
+                    req.getCategoryCode());
             dbBreaker.onSuccess();
             return result;
-        } catch (TimeoutException e) {
-            dbBreaker.onFailure();
-            log.warn("候选检索超时（>{}ms），走兜底", Math.min(remainingMs, dbTimeoutMs));
-            return null;
         } catch (Exception e) {
+            // SQLTimeoutException（MyBatis timeout）/ 3024 Query execution was interrupted
+            // （MAX_EXECUTION_TIME 服务端中断）/ 其它 DB 异常，统一计一次失败
             dbBreaker.onFailure();
-            log.warn("候选检索异常，走兜底: {}", e.getMessage());
+            log.warn("候选检索失败（超时/异常），走兜底: {}", e.getMessage());
             return null;
         }
-    }
-
-    /** 用有界线程池包裹一个阻塞调用并限时（剩余预算与子预算取小） */
-    private <T> T withTimeout(Supplier<T> supplier, long deadline) throws Exception {
-        long remainingMs = (deadline - System.nanoTime()) / 1_000_000;
-        if (remainingMs <= 0) {
-            throw new TimeoutException("整体超时预算已耗尽");
-        }
-        return CompletableFuture
-                .supplyAsync(supplier, timeoutPool)
-                .get(Math.min(remainingMs, redisTimeoutMs), TimeUnit.MILLISECONDS);
     }
 
     /** 兜底广告出口：Redis 优先，失败回退静态常量。hasAd=1、fallback=true、不计二价 */

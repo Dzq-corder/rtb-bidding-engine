@@ -11,7 +11,6 @@ import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Service;
 
 import com.rtb.entity.Ad;
-import com.rtb.mapper.AdMapper;
 
 import java.math.BigDecimal;
 import java.time.Duration;
@@ -68,15 +67,13 @@ public class BudgetService {
     private static final RedisScript<Long> DEDUCT_SCRIPT = new DefaultRedisScript<>(DEDUCT_LUA, Long.class);
 
     private final StringRedisTemplate redis;
-    private final AdMapper adMapper;
 
     /** 预热播种时给 key 设置的存活时长（秒），默认 2 天；与 BudgetKeyCleaner 的保留窗口互为兜底 */
     @Value("${rtb.budget.key-ttl-seconds:172800}")
     private long keyTtlSeconds;
 
-    public BudgetService(StringRedisTemplate redis, AdMapper adMapper) {
+    public BudgetService(StringRedisTemplate redis) {
         this.redis = redis;
-        this.adMapper = adMapper;
     }
 
     private String budgetKey(Long adId) {
@@ -110,6 +107,13 @@ public class BudgetService {
      * <p>Redis 以单线程执行 Lua，脚本运行期间不会被其他命令打断，因此并发请求
      * 之间不存在「都读到旧余额、都通过校验」的窗口，超扣被彻底消除。
      *
+     * <p><b>M7 修正（职责解耦）</b>：本方法现在<b>只做 Redis 原子扣减</b>，不再内嵌
+     * MySQL 状态写。余额不足（返回 {@code false}）时由调用方（{@code BidService}）在
+     * <b>脱离 Redis 超时包裹与 Redis 熔断器</b>的上下文中单独落 {@code ad.status=0}。
+     * 原因：内嵌 MySQL 写会让「DB 写慢 / 异常」被误计入 Redis 耗时字段
+     * （{@code billCostMs}），更糟的是会被 {@code redisBreaker.onFailure()} 误判为
+     * Redis 故障从而错误打开 Redis 熔断器（职责错乱）。两种性质截然不同的操作必须分开。
+     *
      * @return true 扣减成功（脚本返回 1）；false 余额不足（脚本返回 0）
      */
     public boolean deduct(Long adId, BigDecimal dailyBudget, BigDecimal amount) {
@@ -117,19 +121,7 @@ public class BudgetService {
         Long result = redis.execute(DEDUCT_SCRIPT, keys,
                 String.valueOf(toCents(amount)),
                 String.valueOf(toCents(dailyBudget)));
-        boolean ok = result != null && result == 1L;
-        if (!ok) {
-            // 余额不足（含零头不够一次整扣）：标记广告当日已耗尽。
-            // 检索 SQL 带 WHERE a.status = 1，标记后该广告在候选阶段即被排除，
-            // 避免后续请求重复跑扣减判断。
-            // 注意：Redis 不可达时 redis.execute 抛异常、走不到这里，不会误标 status。
-            try {
-                adMapper.markExhausted(adId);
-            } catch (Exception ex) {
-                log.warn("标记广告已耗尽失败 adId={}: {}", adId, ex.getMessage());
-            }
-        }
-        return ok;
+        return result != null && result == 1L;
     }
 
     /**

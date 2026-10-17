@@ -72,7 +72,9 @@ mybatis:
     log-impl: org.apache.ibatis.logging.slf4j.Slf4jImpl
     map-underscore-to-camel-case: true
     default-fetch-size: 100
-    default-statement-timeout: 5
+    # 全局语句超时（秒）。单位是「秒」，3 = 3000ms。
+    # 竞价热路径 findCandidates 单独用 timeout="1" + MAX_EXECUTION_TIME(800) 收紧，不依赖这个全局值
+    default-statement-timeout: 3
   mapper-locations: classpath:mapper/*.xml
 
 management:
@@ -101,14 +103,12 @@ logging:
 
 rtb:
   # ===== M5 超时与熔断配置 =====
-  # 整条链路总超时预算（ms）：SLA 闸门，超过即放弃后续步骤走兜底
+  # 整条链路总超时预算（ms）：SLA 闸门，超过即放弃后续候选走兜底
+  # M9 去线程池后，各依赖的超时不再由这里控制，而是下沉到驱动/SQL 层：
+  #   · DB 候选检索：AdMapper.xml 的 MAX_EXECUTION_TIME(800) + timeout="1"
+  #   · Redis 计费：spring.data.redis.timeout: 200ms（Lettuce 命令超时）
   timeout:
     total-ms: 1000
-    # DB 候选检索子预算（ms）：当前 m1-explore 线 M2 未完成，检索为全表扫(~250ms)，
-    # 故设 800 留出余量让正常路径跑通；演示故障时可临时调小(如 10)触发超时兜底
-    db-ms: 800
-    # Redis 计费子预算（ms）
-    redis-ms: 200
   circuit-breaker:
     # 连续失败达到该值 → OPEN（后续请求短路兜底）
     failure-threshold: 5
