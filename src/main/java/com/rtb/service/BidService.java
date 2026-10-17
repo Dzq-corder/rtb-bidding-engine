@@ -58,6 +58,8 @@ public class BidService {
     private final BidEventPublisher bidEventPublisher;
     /** M7：竞价明细异步落库缓冲（本地有界队列 + 后台批量刷盘） */
     private final BidDetailBuffer bidDetailBuffer;
+    /** M9：「预算耗尽」状态回写缓冲（本地有界队列 + 后台批量 UPDATE） */
+    private final ExhaustedBuffer exhaustedBuffer;
 
     /** 二价最小加价单位（元）。默认 1 分，可通过 rtb.min-increment 覆盖 */
     @Value("${rtb.min-increment:0.01}")
@@ -100,6 +102,7 @@ public class BidService {
                       ObjectMapper objectMapper,
                       BidEventPublisher bidEventPublisher,
                       BidDetailBuffer bidDetailBuffer,
+                      ExhaustedBuffer exhaustedBuffer,
                       @Value("${rtb.circuit-breaker.failure-threshold:5}") int failureThreshold,
                       @Value("${rtb.circuit-breaker.cooldown-ms:5000}") long cooldownMs) {
         this.adMapper = adMapper;
@@ -108,6 +111,7 @@ public class BidService {
         this.objectMapper = objectMapper;
         this.bidEventPublisher = bidEventPublisher;
         this.bidDetailBuffer = bidDetailBuffer;
+        this.exhaustedBuffer = exhaustedBuffer;
         this.dbBreaker = new CircuitBreaker(failureThreshold, cooldownMs);
         this.redisBreaker = new CircuitBreaker(failureThreshold, cooldownMs);
         seedFallbackAd();
@@ -235,15 +239,13 @@ public class BidService {
 
         billCostMs = ms(bStart, System.nanoTime());   // ← 此时仅含 Redis 扣减耗时，不含后续 MySQL 回写
 
-        // M7 修正：计费相位之外、统一回写「余额不足」广告的 MySQL 状态（ad.status=0，
-        // 使检索 SQL 的 WHERE a.status=1 在后续请求中直接排除）。已完全脱离 Redis 超时包裹、
-        // Redis 熔断器与 billCostMs 计时；失败仅告警，不影响本次竞价返回。
+        // M9 修正：计费相位之外、把「余额不足」的广告 id 投递到后台缓冲，由常驻线程
+        // 攒批回写 MySQL 状态（ad.status=3，使检索 SQL 的 WHERE a.status=1 后续直接排除）。
+        // 这里只做一次 offer（纳秒级），请求线程不再等待 DB —— 即便本条请求已走兜底返回，
+        // 回写仍会在后台完成。已完全脱离 Redis 超时包裹、Redis 熔断器与 billCostMs 计时；
+        // 数据可丢（丢了下一次请求再判一次余额不足即自愈），队列满时直接丢弃。
         for (Long id : exhaustedToMark) {
-            try {
-                adMapper.markExhausted(id);
-            } catch (Exception ex) {
-                log.warn("标记广告已耗尽失败 adId={}: {}", id, ex.getMessage());
-            }
+            exhaustedBuffer.enqueue(id);
         }
 
         // Redis 熔断 OPEN / 预算全部不足 / 整体超时 → 兜底广告保底

@@ -109,7 +109,8 @@ public class BudgetService {
      *
      * <p><b>M7 修正（职责解耦）</b>：本方法现在<b>只做 Redis 原子扣减</b>，不再内嵌
      * MySQL 状态写。余额不足（返回 {@code false}）时由调用方（{@code BidService}）在
-     * <b>脱离 Redis 超时包裹与 Redis 熔断器</b>的上下文中单独落 {@code ad.status=0}。
+     * <b>脱离 Redis 超时包裹与 Redis 熔断器</b>的上下文中投递 {@link ExhaustedBuffer}，
+     * 由后台线程攒批回写 {@code ad.status=3}。
      * 原因：内嵌 MySQL 写会让「DB 写慢 / 异常」被误计入 Redis 耗时字段
      * （{@code billCostMs}），更糟的是会被 {@code redisBreaker.onFailure()} 误判为
      * Redis 故障从而错误打开 Redis 熔断器（职责错乱）。两种性质截然不同的操作必须分开。
