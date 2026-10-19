@@ -72,11 +72,31 @@ public interface AdMapper {
      * 标记广告当日预算已耗尽（status=1 -> 3）。
      *
      * <p>仅当广告当前在投（status=1）时才更新，已是 3 的不动，重复调用幂等。
-     * 由 BudgetService 在 deduct 余额不足时调用；检索 SQL 带
-     * {@code WHERE a.status = 1}，标记后该广告在候选阶段即被排除。
+     * 检索 SQL 带 {@code WHERE a.status = 1}，标记后该广告在候选阶段即被排除。
+     *
+     * <p><b>调用方说明</b>：竞价主链路已不再直接调用本方法，改为投递
+     * {@link com.rtb.service.ExhaustedBuffer} 由后台线程批量调用
+     * {@link #markExhaustedBatch(List)}；本方法保留给管理端/单条补写场景。
      */
     @Update("UPDATE ad SET status = 3 WHERE id = #{id} AND status = 1")
     int markExhausted(@Param("id") Long id);
+
+    /**
+     * 批量标记广告当日预算已耗尽（status=1 -> 3）。
+     *
+     * <p>语义与 {@link #markExhausted(Long)} 完全一致，只是把 N 次往返压成 1 次：
+     * 一条 {@code UPDATE ... WHERE status = 1 AND id IN (...)} 同时处理多个 id，
+     * 只产生一次 redo fsync、只借一次 Hikari 连接。
+     *
+     * <p>返回值为<b>实际被更新的行数</b>：已是 3（或已删除、已下架）的 id 不计入，
+     * 因此调用方可据此观测「真正由 1 翻 3」的广告数。
+     *
+     * @param ids 待标记的广告 id；调用方保证非空（空集合会拼出非法 SQL）
+     */
+    @Update("<script>UPDATE ad SET status = 3 WHERE status = 1 AND id IN "
+            + "<foreach collection='ids' item='id' open='(' separator=',' close=')'>#{id}</foreach>"
+            + "</script>")
+    int markExhaustedBatch(@Param("ids") List<Long> ids);
 
     // =====================================================================
     // 管理端 CRUD（服务 /admin/ad 这批接口）

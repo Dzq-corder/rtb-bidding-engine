@@ -67,6 +67,21 @@
       <artifactId>spring-kafka</artifactId>
     </dependency>
 
+    <!--
+      Sentinel 核心：熔断降级（M8 替换自写的 CircuitBreaker）。
+      只引 core —— 规则全部在代码内定义：
+        · 不引 sentinel-transport-* / dashboard 客户端 → 不启控制台、不占端口、无多余进程
+        · 控制台改的规则默认不持久化（重启即还原），代码内定义反而更可靠
+      选 SphU 原生 API 而非 @SentinelResource 注解：
+        · 不需要 AspectJ 织入，不动 Spring 代理结构，改造风险最低
+        · 熔断粒度能落在「依赖」上（DB 一个资源、Redis 一个资源），而不是整个接口
+    -->
+    <dependency>
+      <groupId>com.alibaba.csp</groupId>
+      <artifactId>sentinel-core</artifactId>
+      <version>1.8.6</version>
+    </dependency>
+
     <dependency>
       <groupId>org.projectlombok</groupId>
       <artifactId>lombok</artifactId>

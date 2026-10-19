@@ -14,7 +14,14 @@ spring:
 
   datasource:
     # 本地演示环境不设密码，对应 docker-compose.yml 的 MYSQL_ALLOW_EMPTY_PASSWORD
-    url: jdbc:mysql://127.0.0.1:3306/rtb?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&rewriteBatchedStatements=true
+    #
+    # socketTimeout=3000：网络层保险丝。MySQL 驱动默认 0（无限等），一旦网络丢包/连接
+    #   卡死，客户端会一直挂在 read 上——此时 MAX_EXECUTION_TIME 帮不了（SQL 没到服务端），
+    #   MyBatis timeout 的取消也要另开连接发 KILL QUERY，同样发不出去。
+    #   语义是「两次网络读之间的静默上限」，对非流式查询等同于语句总时长上限。
+    #   取 3000 与 hikari.connection-timeout 对齐；比它更小的值会误伤后台报表/批量写。
+    # connectTimeout=3000：建连阶段的 TCP 超时（默认 0 时，对端丢包会等到系统默认 20s+）。
+    url: jdbc:mysql://127.0.0.1:3306/rtb?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&rewriteBatchedStatements=true&socketTimeout=3000&connectTimeout=3000
     username: root
     password:
     driver-class-name: com.mysql.cj.jdbc.Driver
@@ -72,7 +79,9 @@ mybatis:
     log-impl: org.apache.ibatis.logging.slf4j.Slf4jImpl
     map-underscore-to-camel-case: true
     default-fetch-size: 100
-    default-statement-timeout: 5
+    # 全局语句超时（秒）。单位是「秒」，3 = 3000ms。
+    # 竞价热路径 findCandidates 单独用 timeout="1" + MAX_EXECUTION_TIME(800) 收紧，不依赖这个全局值
+    default-statement-timeout: 3
   mapper-locations: classpath:mapper/*.xml
 
 management:
@@ -101,19 +110,33 @@ logging:
 
 rtb:
   # ===== M5 超时与熔断配置 =====
-  # 整条链路总超时预算（ms）：SLA 闸门，超过即放弃后续步骤走兜底
+  # 整条链路总超时预算（ms）：SLA 闸门，超过即放弃后续候选走兜底
+  # M9 去线程池后，各依赖的超时不再由这里控制，而是下沉到驱动/SQL 层：
+  #   · DB 候选检索：AdMapper.xml 的 MAX_EXECUTION_TIME(800) + timeout="1"
+  #   · Redis 计费：spring.data.redis.timeout: 200ms（Lettuce 命令超时）
   timeout:
     total-ms: 1000
-    # DB 候选检索子预算（ms）：当前 m1-explore 线 M2 未完成，检索为全表扫(~250ms)，
-    # 故设 800 留出余量让正常路径跑通；演示故障时可临时调小(如 10)触发超时兜底
-    db-ms: 800
-    # Redis 计费子预算（ms）
-    redis-ms: 200
   circuit-breaker:
+    # 熔断实现：sentinel = 阿里 Sentinel「慢调用比例」熔断；local = 早期自写的连续失败计数实现。
+    # 两者阈值口径不同（一个是慢调用比例，一个是连续失败次数），切换后不能直接比"谁先开闸"，
+    # 只能在同一场故障演练里比"打开时刻 / 短路比例 / 自愈耗时"。
+    impl: sentinel
+    # 熔断持续时长（ms）。Sentinel 的 timeWindow 只接受「秒」，装载时按 1000 换算，只支持秒级精度。
+    cooldown-ms: 5000
+    # --- 以下仅 local 实现使用 ---
     # 连续失败达到该值 → OPEN（后续请求短路兜底）
     failure-threshold: 5
-    # OPEN 冷却时长（ms），到期后 HALF_OPEN 放一个探活，成功自愈
-    cooldown-ms: 5000
+    # --- 以下仅 Sentinel 实现使用（慢调用比例模式） ---
+    slow-ratio: 0.5
+    min-request-amount: 5
+    stat-interval-ms: 1000
+    # DB 候选检索「慢调用」判定阈值（ms）
+    # 压测实测：200ms 在 16 并发正常流量下就会误开闸（单条正常 40ms，并发抖动常破 200ms，
+    # 慢调用比例轻松越过 0.5），导致 96% 请求被短路走兜底 → 熔断变成"一压就废"。
+    # 故提到 800ms，与 MAX_EXECUTION_TIME 对齐：只把「真打满 SQL 超时」算作慢调用。
+    db-slow-rt-ms: 800
+    # Redis 预算扣减「慢调用」判定阈值（ms），须显著小于 spring.data.redis.timeout(200ms)
+    redis-slow-rt-ms: 100
   fallback:
     # 兜底总开关。生产语义下恒为 true：任何失败都必须收敛到兜底广告。
     # 置 false 仅用于 A/B 对照实验——复现「没有兜底机制的旧实现」，

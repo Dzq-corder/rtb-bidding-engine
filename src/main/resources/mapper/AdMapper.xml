@@ -19,8 +19,15 @@
     为什么用 <if> 拼 JOIN 而不用别的写法：
       语义直白，面试时可以逐段讲清楚「哪一段是 M2 要换掉的」。
   -->
-  <select id="findCandidates" resultType="com.rtb.entity.Ad">
-    SELECT a.id, a.advertiser_id, a.title, a.creative_url, a.category_code,
+  <!--
+    M9：竞价热路径的超时下沉到 SQL 层（取消应用级线程池），两道闸门：
+      1) SELECT /*+ MAX_EXECUTION_TIME(800) */ —— MySQL 服务端毫秒级中断，仅作用于本 SELECT；
+         超时返回 error 3024，JDBC 抛 SQLException，BidService 记为一次 DB 失败 → 喂熔断。
+      2) timeout="1" —— MyBatis 客户端秒级保险丝（单位是秒，最小 1s，无法表达 800ms）。
+    其它 SQL 不受影响，仍走 mybatis.configuration.default-statement-timeout（3s）。
+  -->
+  <select id="findCandidates" timeout="1" resultType="com.rtb.entity.Ad">
+    SELECT /*+ MAX_EXECUTION_TIME(800) */ a.id, a.advertiser_id, a.title, a.creative_url, a.category_code,
            a.bid, a.daily_budget, a.status, a.created_at, a.updated_at
     FROM ad a
     <if test="region != null">
