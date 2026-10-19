@@ -117,10 +117,26 @@ rtb:
   timeout:
     total-ms: 1000
   circuit-breaker:
+    # 熔断实现：sentinel = 阿里 Sentinel「慢调用比例」熔断；local = 早期自写的连续失败计数实现。
+    # 两者阈值口径不同（一个是慢调用比例，一个是连续失败次数），切换后不能直接比"谁先开闸"，
+    # 只能在同一场故障演练里比"打开时刻 / 短路比例 / 自愈耗时"。
+    impl: sentinel
+    # 熔断持续时长（ms）。Sentinel 的 timeWindow 只接受「秒」，装载时按 1000 换算，只支持秒级精度。
+    cooldown-ms: 5000
+    # --- 以下仅 local 实现使用 ---
     # 连续失败达到该值 → OPEN（后续请求短路兜底）
     failure-threshold: 5
-    # OPEN 冷却时长（ms），到期后 HALF_OPEN 放一个探活，成功自愈
-    cooldown-ms: 5000
+    # --- 以下仅 Sentinel 实现使用（慢调用比例模式） ---
+    slow-ratio: 0.5
+    min-request-amount: 5
+    stat-interval-ms: 1000
+    # DB 候选检索「慢调用」判定阈值（ms）
+    # 压测实测：200ms 在 16 并发正常流量下就会误开闸（单条正常 40ms，并发抖动常破 200ms，
+    # 慢调用比例轻松越过 0.5），导致 96% 请求被短路走兜底 → 熔断变成"一压就废"。
+    # 故提到 800ms，与 MAX_EXECUTION_TIME 对齐：只把「真打满 SQL 超时」算作慢调用。
+    db-slow-rt-ms: 800
+    # Redis 预算扣减「慢调用」判定阈值（ms），须显著小于 spring.data.redis.timeout(200ms)
+    redis-slow-rt-ms: 100
   fallback:
     # 兜底总开关。生产语义下恒为 true：任何失败都必须收敛到兜底广告。
     # 置 false 仅用于 A/B 对照实验——复现「没有兜底机制的旧实现」，

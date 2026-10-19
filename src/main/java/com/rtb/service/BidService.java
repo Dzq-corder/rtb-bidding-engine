@@ -7,8 +7,10 @@ import com.rtb.service.BudgetService;
 import com.rtb.dto.BidEvent;
 import com.rtb.mq.BidEventPublisher;
 import com.rtb.service.BidDetailBuffer;
-import com.rtb.common.CircuitBreaker;
+import com.rtb.common.breaker.BreakerGate;
+import com.rtb.common.breaker.BreakerOpenException;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
@@ -84,9 +86,9 @@ public class BidService {
     @Value("${rtb.fallback.enabled:true}")
     private boolean fallbackEnabled;
 
-    /** M5：DB 与 Redis 各自独立熔断器，互不影响 */
-    private final CircuitBreaker dbBreaker;
-    private final CircuitBreaker redisBreaker;
+    /** M5/M8：DB 与 Redis 各自独立的熔断门（impl 可切 sentinel / local），互不影响 */
+    private final BreakerGate dbBreaker;
+    private final BreakerGate redisBreaker;
 
     /** M5：兜底广告静态常量（Redis 不可用时的最后保底，保证永远有广告可返回） */
     private static final Ad STATIC_FALLBACK = buildStaticFallback();
@@ -103,8 +105,8 @@ public class BidService {
                       BidEventPublisher bidEventPublisher,
                       BidDetailBuffer bidDetailBuffer,
                       ExhaustedBuffer exhaustedBuffer,
-                      @Value("${rtb.circuit-breaker.failure-threshold:5}") int failureThreshold,
-                      @Value("${rtb.circuit-breaker.cooldown-ms:5000}") long cooldownMs) {
+                      @Qualifier("dbBreakerGate") BreakerGate dbBreaker,
+                      @Qualifier("redisBreakerGate") BreakerGate redisBreaker) {
         this.adMapper = adMapper;
         this.budgetService = budgetService;
         this.redis = redis;
@@ -112,8 +114,8 @@ public class BidService {
         this.bidEventPublisher = bidEventPublisher;
         this.bidDetailBuffer = bidDetailBuffer;
         this.exhaustedBuffer = exhaustedBuffer;
-        this.dbBreaker = new CircuitBreaker(failureThreshold, cooldownMs);
-        this.redisBreaker = new CircuitBreaker(failureThreshold, cooldownMs);
+        this.dbBreaker = dbBreaker;
+        this.redisBreaker = redisBreaker;
         seedFallbackAd();
     }
 
@@ -193,47 +195,47 @@ public class BidService {
         // M7 修正：余额不足需回写 MySQL 状态的广告先收集，计费相位结束后再统一落库，
         // 彻底脱离 Redis 超时包裹、Redis 熔断与 billCostMs（Redis 计费耗时）计时。
         List<Long> exhaustedToMark = new ArrayList<>();
-        if (redisBreaker.allowRequest()) {
-            for (int i = 0; i < matched.size(); i++) {
-                // 整体超时预算耗尽 → 放弃后续计费，兜底收尾
-                if (System.nanoTime() > deadline) {
-                    break;
-                }
-                Ad candidate = matched.get(i);
-                // 二价成交价：次高出价 + 最小加价，且不超过自身出价
-                BigDecimal secondBid = (i + 1 < matched.size())
-                        ? matched.get(i + 1).getBid()      // 下一名（次高）的出价
-                        : candidate.getBid();               // 仅一名候选，次高=自身
-                BigDecimal price = secondBid.add(minIncrement).min(candidate.getBid());
+        for (int i = 0; i < matched.size(); i++) {
+            // 整体超时预算耗尽 → 放弃后续计费，兜底收尾
+            if (System.nanoTime() > deadline) {
+                break;
+            }
+            Ad candidate = matched.get(i);
+            // 二价成交价：次高出价 + 最小加价，且不超过自身出价
+            BigDecimal secondBid = (i + 1 < matched.size())
+                    ? matched.get(i + 1).getBid()      // 下一名（次高）的出价
+                    : candidate.getBid();               // 仅一名候选，次高=自身
+            BigDecimal price = secondBid.add(minIncrement).min(candidate.getBid());
 
-                boolean deducted = false;
-                boolean redisFailed = false;
-                try {
-                    // M9 去线程池：同步调用。Redis 命令超时由 Lettuce 的
-                    // spring.data.redis.timeout(200ms) 在驱动层负责，到点抛 RedisCommandTimeoutException
-                    deducted = budgetService.deduct(
-                            candidate.getId(), candidate.getDailyBudget(), price);
-                    redisBreaker.onSuccess();
-                } catch (Exception e) {
-                    // 仅 Lettuce 命令超时 / 连接异常才算 Redis 失败并触发熔断；
-                    // 余额不足（deduct 正常返回 false）不属于 Redis 故障，不在此分支。
-                    redisBreaker.onFailure();
-                    redisFailed = true;
-                    deducted = false;
-                }
-                if (deducted) {
-                    winner = candidate;
-                    payPrice = price;
-                    adId = candidate.getId();
-                    advertiserId = candidate.getAdvertiserId();
-                    break;
-                }
-                // M7 修正（职责解耦）：仅收集「Redis 正常返回余额不足」的候选，
-                // 不在计费相位内写 MySQL（避免污染 billCostMs、受 Redis 200ms 子超时约束、
-                // 误开 Redis 熔断器）。Redis 故障（redisFailed）的候选不收集、不误标。
-                if (!redisFailed) {
-                    exhaustedToMark.add(candidate.getId());
-                }
+            boolean deducted = false;
+            boolean redisFailed = false;
+            try {
+                // 熔断门包裹单次扣减：粒度是「一次 Redis 调用」，慢调用阈值才对得上
+                // spring.data.redis.timeout(200ms)。
+                deducted = redisBreaker.call(() -> budgetService.deduct(
+                        candidate.getId(), candidate.getDailyBudget(), price));
+            } catch (BreakerOpenException e) {
+                // 熔断未放行（短路，未触达 Redis）→ 本请求不再尝试任何候选，整段计费放弃 → 兜底
+                log.warn("Redis 计费熔断短路（未放行），走兜底");
+                break;
+            } catch (Exception e) {
+                // 仅 Lettuce 命令超时 / 连接异常才算 Redis 失败；
+                // 余额不足（deduct 正常返回 false）不属于 Redis 故障，不在此分支。
+                redisFailed = true;
+                deducted = false;
+            }
+            if (deducted) {
+                winner = candidate;
+                payPrice = price;
+                adId = candidate.getId();
+                advertiserId = candidate.getAdvertiserId();
+                break;
+            }
+            // M7 修正（职责解耦）：仅收集「Redis 正常返回余额不足」的候选，
+            // 不在计费相位内写 MySQL（避免污染 billCostMs、受 Redis 200ms 子超时约束、
+            // 误开 Redis 熔断器）。Redis 故障（redisFailed）的候选不收集、不误标。
+            if (!redisFailed) {
+                exhaustedToMark.add(candidate.getId());
             }
         }
 
@@ -350,23 +352,23 @@ public class BidService {
      * @return 候选列表；任一失败（熔断/超时/异常）返回 null，由调用方走兜底
      */
     private List<Ad> retrieveCandidates(BidRequest req) {
-        if (!dbBreaker.allowRequest()) {
-            return null; // 熔断 OPEN → 兜底
-        }
         try {
-            // 同步调用：超时由 SQL hint(800ms) + MyBatis timeout(1s) 兜住
-            List<Ad> result = adMapper.findCandidates(
+            // 熔断门在外、SQL 在内：门测到的是这次 DB 调用的真实 RT，
+            // 慢调用比例可直接捕捉「DB 变慢」，无需手工计时上报。
+            // 超时由 SQL hint(800ms) + MyBatis timeout(1s) 兜住。
+            return dbBreaker.call(() -> adMapper.findCandidates(
                     req.getRegion(),
                     TargetingMapper.resolveAgeBucket(req.getAge(), req.getAgeBucket()),
                     TargetingMapper.toGender(req.getGender()),
-                    req.getCategoryCode());
-            dbBreaker.onSuccess();
-            return result;
+                    req.getCategoryCode()));
+        } catch (BreakerOpenException e) {
+            // 熔断未放行：短路，本次未触达 DB
+            log.warn("候选检索熔断短路（DB 未放行），走兜底");
+            return null;
         } catch (Exception e) {
             // SQLTimeoutException（MyBatis timeout）/ 3024 Query execution was interrupted
             // （MAX_EXECUTION_TIME 服务端中断）/ 其它 DB 异常，统一计一次失败
-            dbBreaker.onFailure();
-            log.warn("候选检索失败（超时/异常），走兜底: {}", e.getMessage());
+            log.warn("候选检索失败（超时/异常），走兜底: {} - {}", e.getClass().getSimpleName(), e.getMessage());
             return null;
         }
     }
