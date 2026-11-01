@@ -62,6 +62,8 @@ public class BidService {
     private final BidDetailBuffer bidDetailBuffer;
     /** M9：「预算耗尽」状态回写缓冲（本地有界队列 + 后台批量 UPDATE） */
     private final ExhaustedBuffer exhaustedBuffer;
+    /** 频控（frequency capping）：同标识 + 同广告 + 同自然日曝光上限 */
+    private final FrequencyService frequencyService;
 
     /** 二价最小加价单位（元）。默认 1 分，可通过 rtb.min-increment 覆盖 */
     @Value("${rtb.min-increment:0.01}")
@@ -105,6 +107,7 @@ public class BidService {
                       BidEventPublisher bidEventPublisher,
                       BidDetailBuffer bidDetailBuffer,
                       ExhaustedBuffer exhaustedBuffer,
+                      FrequencyService frequencyService,
                       @Qualifier("dbBreakerGate") BreakerGate dbBreaker,
                       @Qualifier("redisBreakerGate") BreakerGate redisBreaker) {
         this.adMapper = adMapper;
@@ -114,6 +117,7 @@ public class BidService {
         this.bidEventPublisher = bidEventPublisher;
         this.bidDetailBuffer = bidDetailBuffer;
         this.exhaustedBuffer = exhaustedBuffer;
+        this.frequencyService = frequencyService;
         this.dbBreaker = dbBreaker;
         this.redisBreaker = redisBreaker;
         seedFallbackAd();
@@ -138,7 +142,7 @@ public class BidService {
         // 强制兜底（演示/复现开关）：直接返回兜底广告，模拟依赖全面故障
         if (forceFallback) {
             BidRequest.Result r = buildFallback(requestId);
-            emit(requestId, req, r, ms(startNanos, System.nanoTime()), 0, 0);
+            emit(requestId, req, r, ms(startNanos, System.nanoTime()), 0, 0, 0);
             return r;
         }
 
@@ -155,7 +159,7 @@ public class BidService {
             // 候选检索失败（DB 熔断 OPEN / 超时 / 异常）→ 兜底，绝不返回空结果
             BidRequest.Result r = buildFallback(requestId);
             // 发布一条兜底竞价事件（旁路），并带上已统计的候选检索耗时
-            emit(requestId, req, r, ms(startNanos, System.nanoTime()), candidateCostMs, 0);
+            emit(requestId, req, r, ms(startNanos, System.nanoTime()), candidateCostMs, 0, 0);
             // 直接返回兜底结果，结束本次竞价
             return r;
         }
@@ -168,14 +172,34 @@ public class BidService {
         // 候选为空（检索无命中）→ 兜底，不返回空广告
         if (matched.isEmpty()) {
             BidRequest.Result r = buildFallback(requestId);
-            emit(requestId, req, r, ms(startNanos, System.nanoTime()), candidateCostMs, 0);
+            emit(requestId, req, r, ms(startNanos, System.nanoTime()), candidateCostMs, 0, 0);
+            return r;
+        }
+
+        // ---------------------------------------------------------
+        // ②.5 频控过滤（软频控，纯读、无副作用、异常自动放行）
+        //      放在预算预热之前：先剔掉注定不能投的候选，少建一批 key、少几次扣减往返。
+        //      被剔除的候选不参与后续二价计算 —— 它本来就不能展示，不应充当「次高价」。
+        // ---------------------------------------------------------
+        String freqIdent = FrequencyService.identOf(req.getUserId(), req.getClientIp());
+        FrequencyService.FilterResult freqResult = frequencyService.filter(freqIdent, matched);
+        List<Ad> effective = freqResult.remaining();
+        int freqFiltered = freqResult.filtered();
+
+        // 候选全部超频 → 兜底（与「检索为空」同一出口，绝不返回空广告）
+        if (effective.isEmpty()) {
+            BidRequest.Result r = buildFallback(requestId);
+            // 把真实剔除数带出去，便于区分「无候选」与「全部超频」两种兜底
+            r.setFreqFilteredCnt(freqFiltered);
+            emit(requestId, req, r, ms(startNanos, System.nanoTime()), candidateCostMs, 0, freqFiltered);
             return r;
         }
 
         // 检索阶段预算预热：为本次候选惰性补建 Redis 预算 key（SET NX + 2 天过期），
         // 把「初始化写」从计费热路径挪到检索侧。best-effort：失败忽略，计费时 Lua 会惰性兜底。
+        // 预热对象是频控后的 effective —— 预热的应当是「真正可能成交的候选」。
         try {
-            budgetService.warmBudgets(matched);
+            budgetService.warmBudgets(effective);
         } catch (Exception e) {
             log.warn("预算预热失败（忽略，计费时惰性兜底）requestId={}: {}", requestId, e.getMessage());
         }
@@ -195,15 +219,16 @@ public class BidService {
         // M7 修正：余额不足需回写 MySQL 状态的广告先收集，计费相位结束后再统一落库，
         // 彻底脱离 Redis 超时包裹、Redis 熔断与 billCostMs（Redis 计费耗时）计时。
         List<Long> exhaustedToMark = new ArrayList<>();
-        for (int i = 0; i < matched.size(); i++) {
+        for (int i = 0; i < effective.size(); i++) {
             // 整体超时预算耗尽 → 放弃后续计费，兜底收尾
             if (System.nanoTime() > deadline) {
                 break;
             }
-            Ad candidate = matched.get(i);
+            Ad candidate = effective.get(i);
             // 二价成交价：次高出价 + 最小加价，且不超过自身出价
-            BigDecimal secondBid = (i + 1 < matched.size())
-                    ? matched.get(i + 1).getBid()      // 下一名（次高）的出价
+            // 次高从「频控后」的 effective 取：被频控剔除的候选不能展示，不应充当二价参照
+            BigDecimal secondBid = (i + 1 < effective.size())
+                    ? effective.get(i + 1).getBid()    // 下一名（次高）的出价
                     : candidate.getBid();               // 仅一名候选，次高=自身
             BigDecimal price = secondBid.add(minIncrement).min(candidate.getBid());
 
@@ -253,17 +278,22 @@ public class BidService {
         // Redis 熔断 OPEN / 预算全部不足 / 整体超时 → 兜底广告保底
         if (winner == null) {
             BidRequest.Result r = buildFallback(requestId);
-            emit(requestId, req, r, ms(startNanos, System.nanoTime()), candidateCostMs, billCostMs);
+            emit(requestId, req, r, ms(startNanos, System.nanoTime()), candidateCostMs, billCostMs, freqFiltered);
             return r;
         }
 
-        // [已注释] 分段计时埋点 + bid_log 落库（M1 baseline 压测期间不采集统计，纯服务化）
-        // persistLog(requestId, req, candidates.size(), matched.size(),
-        //         adId, advertiserId, winner, payPrice,
-        //         costMs, candidateCost, filterCost, sortCost, billCost);
+        // ---------------------------------------------------------
+        // ④.5 频控计数（中标即计数，软频控）
+        //      位置必须在 billCostMs 之后：否则它的耗时会被算进「计费耗时」，
+        //      污染这个已经用于压测归因的指标。
+        //      不套 redisBreaker：那个门承载「Redis 是否可信到可以扣钱」，
+        //      频控失败不该累加它的失败计数（否则 Redis 抖一下会误开预算熔断）。
+        //      recordWin 内部 try-catch，失败只记日志，不影响本次返回。
+        // ---------------------------------------------------------
+        frequencyService.recordWin(freqIdent, winner.getId());
 
-        BidRequest.Result r = buildResult(requestId, candidates, matched, winner, payPrice);
-        emit(requestId, req, r, ms(startNanos, System.nanoTime()), candidateCostMs, billCostMs);
+        BidRequest.Result r = buildResult(requestId, candidates, matched, effective, winner, payPrice);
+        emit(requestId, req, r, ms(startNanos, System.nanoTime()), candidateCostMs, billCostMs, freqFiltered);
         return r;
     }
 
@@ -301,7 +331,7 @@ public class BidService {
      * @param billCostMs     计费耗时（ms），Redis 预算扣减循环
      */
     private void emit(String requestId, BidRequest req, BidRequest.Result r,
-                      int costMs, int candidateCostMs, int billCostMs) {
+                      int costMs, int candidateCostMs, int billCostMs, int freqFiltered) {
         // 1) 计费事件旁路（Kafka，fire-and-forget，不阻塞）
         publishBidEvent(requestId, req.getRegion(), r);
         // 2) 竞价明细入本地有界队列，后台线程批量落库（可丢、可采样）
@@ -311,12 +341,15 @@ public class BidService {
             log.setAdId(r.getWinner() != null ? r.getWinner().getAdId() : null);
             log.setAdvertiserId(r.getWinner() != null ? r.getWinner().getAdvertiserId() : null);
             log.setSlotCode(req.getSlotCode());
+            // 频控维度：只落 userId（IP 属临时标识，不入库避免污染统计口径）
+            log.setUserId(req.getUserId());
             log.setRegion(req.getRegion());
             log.setAge(req.getAge());
             log.setGender(req.getGender());
             log.setInterests(req.getInterests() != null ? req.getInterests() : "");
             log.setCandidateCnt(r.getCandidateCnt());
             log.setMatchCnt(r.getMatchCnt());
+            log.setFreqFilteredCnt(freqFiltered);
             log.setHasAd(Boolean.TRUE.equals(r.getHasAd()) ? 1 : 0);
             log.setWinBid(r.getWinner() != null ? r.getWinner().getBid() : null);
             log.setPayPrice(r.getPayPrice());
@@ -384,6 +417,7 @@ public class BidService {
             empty.setPriceMode(2);
             empty.setCandidateCnt(0);
             empty.setMatchCnt(0);
+            empty.setFreqFilteredCnt(0);
             empty.setTopCandidates(List.of());
             return empty;
         }
@@ -396,6 +430,8 @@ public class BidService {
         r.setPayPrice(null);        // 兜底不计费
         r.setCandidateCnt(0);
         r.setMatchCnt(0);
+        // 由调用方按需覆盖（候选全部超频的场景会把真实剔除数填进来）
+        r.setFreqFilteredCnt(0);
         r.setTopCandidates(List.of());
 
         BidRequest.AdInfo info = new BidRequest.AdInfo();
@@ -447,14 +483,23 @@ public class BidService {
         return a;
     }
 
+    /**
+     * @param candidates 检索返回的全部候选（频控前）
+     * @param matched    定向过滤后、频控前（matchCnt 口径）
+     * @param effective  频控后、真正参与计费的候选（topCandidates 与二价都基于它）
+     */
     private BidRequest.Result buildResult(String requestId, List<Ad> candidates,
-                                          List<Ad> matched, Ad winner, BigDecimal payPrice) {
+                                          List<Ad> matched, List<Ad> effective,
+                                          Ad winner, BigDecimal payPrice) {
         BidRequest.Result r = new BidRequest.Result();
         r.setRequestId(requestId);
         r.setHasAd(winner != null);
         r.setFallback(false);
         r.setCandidateCnt(candidates.size());
+        // matchCnt 保持原语义（定向过滤后、频控前），频控剔除量单列一字段：
+        // 这样历史数据与新数据的 matchCnt 口径一致，不会出现「同一个字段前后含义不同」。
         r.setMatchCnt(matched.size());
+        r.setFreqFilteredCnt(Math.max(0, matched.size() - effective.size()));
         // 1 = 二价（M4 引入：成交价=次高出价+最小加价，不超过自身出价）
         r.setPriceMode(1);
         r.setPayPrice(payPrice);
@@ -469,11 +514,12 @@ public class BidService {
             r.setWinner(info);
         }
 
-        // 出价前 N 条，演示时展示「为什么是它赢」
-        int topN = Math.min(10, matched.size());
+        // 出价前 N 条，演示时展示「为什么是它赢」。
+        // 用 effective（频控后）：被频控剔除的候选已不参与竞价，列出来会与 winner 矛盾。
+        int topN = Math.min(10, effective.size());
         List<BidRequest.AdInfo> tops = new ArrayList<>(topN);
         for (int i = 0; i < topN; i++) {
-            Ad a = matched.get(i);
+            Ad a = effective.get(i);
             BidRequest.AdInfo info = new BidRequest.AdInfo();
             info.setAdId(a.getId());
             info.setAdvertiserId(a.getAdvertiserId());

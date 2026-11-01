@@ -61,10 +61,10 @@ public class BidDetailBuffer implements InitializingBean, DisposableBean {
     private final AtomicLong flushed = new AtomicLong(0);
 
     private static final String SQL =
-            "INSERT INTO bid_log (request_id, ad_id, advertiser_id, slot_code, region, age, gender, interests, "
-                    + "candidate_cnt, match_cnt, has_ad, win_bid, pay_price, "
+            "INSERT INTO bid_log (request_id, ad_id, advertiser_id, slot_code, user_id, region, age, gender, interests, "
+                    + "candidate_cnt, match_cnt, freq_filtered_cnt, has_ad, win_bid, pay_price, "
                     + "cost_ms, candidate_cost, filter_cost, sort_cost, bill_cost, bid_at) "
-                    + "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+                    + "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
 
     public BidDetailBuffer(JdbcTemplate jdbc) {
         this.jdbc = jdbc;
@@ -204,9 +204,12 @@ public class BidDetailBuffer implements InitializingBean, DisposableBean {
     /** 单条明细 → INSERT 参数数组（同步单条与批量刷盘共用） */
     private Object[] toParams(BidLog l) {
         return new Object[]{
-                l.getRequestId(), l.getAdId(), l.getAdvertiserId(), l.getSlotCode(),
+                l.getRequestId(), l.getAdId(), l.getAdvertiserId(), l.getSlotCode(), l.getUserId(),
                 l.getRegion(), l.getAge(), l.getGender(), l.getInterests(),
-                l.getCandidateCnt(), l.getMatchCnt(), l.getHasAd(),
+                l.getCandidateCnt(), l.getMatchCnt(),
+                // 列 NOT NULL：未设置时落 0，避免批量刷盘整批失败
+                l.getFreqFilteredCnt() == null ? 0 : l.getFreqFilteredCnt(),
+                l.getHasAd(),
                 l.getWinBid(), l.getPayPrice(),
                 l.getCostMs(), l.getCandidateCost(), l.getFilterCost(), l.getSortCost(), l.getBillCost(),
                 l.getBidAt()

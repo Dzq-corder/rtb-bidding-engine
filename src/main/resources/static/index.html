@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RTB 广告流 · 滑动刷新 Demo</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #f3f4f6; color: #1f2937; height: 100vh; overflow: hidden;
+    display: flex; flex-direction: column;
+  }
+  .topbar {
+    flex: 0 0 auto; background: #111827; color: #fff; padding: 12px 18px;
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  }
+  .topbar h1 { font-size: 16px; font-weight: 500; }
+  .stat { font-size: 12px; color: #cbd5e1; }
+  .stat b { color: #fff; font-weight: 500; font-variant-numeric: tabular-nums; }
+  .spacer { flex: 1; }
+  button {
+    font-size: 13px; padding: 7px 14px; border: none; border-radius: 8px;
+    background: #2563eb; color: #fff; cursor: pointer;
+  }
+  button:hover { background: #1d4ed8; }
+  button.ghost { background: #374151; }
+  button.ghost:hover { background: #4b5563; }
+  .feed {
+    flex: 1 1 auto; overflow-y: auto; padding: 16px;
+    display: flex; flex-direction: column; gap: 12px; align-items: center;
+  }
+  .hint {
+    position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+    background: rgba(17,24,39,.82); color: #e5e7eb; font-size: 12px;
+    padding: 8px 16px; border-radius: 999px; pointer-events: none;
+    transition: opacity .4s; z-index: 10;
+  }
+  .card {
+    width: 100%; max-width: 560px; background: #fff; border-radius: 14px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.08); overflow: hidden;
+    animation: rise .25s ease;
+  }
+  @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+  .card .head { padding: 14px 16px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid #f1f5f9; }
+  .card .cover {
+    width: 56px; height: 56px; border-radius: 10px; flex: 0 0 auto;
+    background: linear-gradient(135deg,#60a5fa,#3b82f6); color:#fff;
+    display: flex; align-items: center; justify-content: center; font-size: 20px; font-weight: 600;
+  }
+  .card .ttl { font-size: 15px; font-weight: 500; flex: 1; }
+  .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; }
+  .badge.win { background: #dcfce7; color: #166534; }
+  .badge.fb { background: #fee2e2; color: #991b1b; }
+  .card .body { padding: 12px 16px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px; font-size: 13px; }
+  .cell { color: #6b7280; }
+  .cell b { color: #111827; font-weight: 500; font-variant-numeric: tabular-nums; }
+  .price { color: #b45309; }
+  .price b { color: #b45309; }
+  .err { background: #fff7ed; border: 1px solid #fed7aa; color: #9a3412; padding: 14px 16px; border-radius: 12px; max-width: 560px; }
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <h1>RTB 广告流 · 滑动/点击刷新</h1>
+    <span class="stat">请求 <b id="s-total">0</b></span>
+    <span class="stat">中标 <b id="s-win">0</b></span>
+    <span class="stat">兜底 <b id="s-fb">0</b></span>
+    <span class="stat">均价 <b id="s-avg">¥0.00</b></span>
+    <span class="stat">累计消耗 <b id="s-spend">¥0.00</b></span>
+    <span class="stat">P50 接口 <b id="s-p50">0</b> ms</span>
+    <span class="spacer"></span>
+    <button onclick="loadOne()">手动刷新</button>
+    <button class="ghost" onclick="clearFeed()">清空</button>
+  </div>
+  <div class="feed" id="feed">
+    <div class="err" style="margin-top:40px">等待第一次刷新… 用鼠标滚轮向下滑，或点击「手动刷新」，或点击空白处即可模拟用户滑动加载新广告。</div>
+  </div>
+  <div class="hint" id="hint">滚动或点击即可加载新广告 ▾</div>
+
+<script>
+const feed = document.getElementById('feed');
+const hint = document.getElementById('hint');
+// 取值必须与 ad / ad_target 中的真实数据对齐（对不上的维度会命中 0 条候选 → 全部走兜底）：
+// 区县取库里投放量前三（110120/110109/310113），类目取库里量最大的四个 + null（不过滤）
+const CATS = ['mobile', 'computer', 'food', 'apparel', null];
+const REGIONS = ['110120', '110120', '110120', '110109', '310113']; // 热门区县权重更高
+
+let stats = { total: 0, win: 0, fb: 0, spend: 0, lat: [] };
+let busy = false;
+
+// 演示用的固定用户：频控按「用户 + 广告 + 自然日」累计，同一用户刷第 4 次起该广告不再出现。
+// 想模拟「换一个人来看」，改这里的值即可（或换成随机：'demo-user-' + Math.random()）。
+const USER_ID = 'demo-user-001';
+
+function nextReq() {
+  const age = 18 + Math.floor(Math.random() * 43);          // 18~60
+  const gender = Math.random() < 0.5 ? 1 : 2;               // 男/女
+  const cat = CATS[Math.floor(Math.random() * CATS.length)];
+  const region = REGIONS[Math.floor(Math.random() * REGIONS.length)];
+  return { userId: USER_ID, slotCode: 'slot-demo', region, age, gender, categoryCode: cat };
+}
+
+function fmt(n, d = 2) { return '¥' + Number(n || 0).toFixed(d); }
+
+async function loadOne() {
+  if (busy) return;
+  busy = true;
+  try {
+    const resp = await fetch('/bid', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(nextReq())
+    });
+    const json = await resp.json();
+    if (json.code !== 0 || !json.data) {
+      addCard(null, '后端返回异常：' + (json.msg || resp.status));
+    } else {
+      addCard(json.data, null, json.wallMs);
+    }
+  } catch (e) {
+    addCard(null, '无法连接后端（/bid 不可达）：' + e.message);
+  } finally {
+    busy = false;
+  }
+}
+
+function addCard(d, errMsg, wallMs) {
+  // 清空首屏占位
+  const placeholder = feed.querySelector('.err');
+  if (placeholder && stats.total === 0) feed.innerHTML = '';
+
+  let el;
+  if (errMsg) {
+    const dErr = document.createElement('div');
+    dErr.className = 'err';
+    dErr.textContent = errMsg;
+    el = dErr;
+  } else {
+    stats.total++;
+    const fb = d.fallback === true;
+    const win = d.hasAd && !fb;
+    if (fb) stats.fb++; else if (win) stats.win++;
+    const pay = d.payPrice ? Number(d.payPrice) : 0;
+    if (win) stats.spend += pay;
+    if (wallMs != null) stats.lat.push(wallMs);
+    const p50 = stats.lat.length ? stats.lat.slice().sort((a, b) => a - b)[Math.floor(stats.lat.length / 2)] : 0;
+    const avg = stats.win ? stats.spend / stats.win : 0;
+
+    const c = document.createElement('div');
+    c.className = 'card';
+    const cover = (d.winner && d.winner.title ? d.winner.title.trim().charAt(0) : '广');
+    const priceMode = d.priceMode === 1 ? '二价' : '一价';
+    c.innerHTML = `
+      <div class="head">
+        <div class="cover">${cover}</div>
+        <div class="ttl">${d.winner ? esc(d.winner.title) : '（无可用广告）'}</div>
+        <span class="badge ${fb ? 'fb' : 'win'}">${fb ? '兜底' : '中标'}</span>
+      </div>
+      <div class="body">
+        <span class="cell">广告ID <b>${d.winner ? d.winner.adId : '-'}</b></span>
+        <span class="cell">广告主 <b>${d.winner ? d.winner.advertiserId : '-'}</b></span>
+        <span class="cell">类目 <b>${d.winner ? esc(d.winner.categoryCode || '-') : '-'}</b></span>
+        <span class="cell">候选集 <b>${d.candidateCnt != null ? d.candidateCnt : '-'}</b></span>
+        <span class="cell">频控剔除 <b style="${d.freqFilteredCnt > 0 ? 'color:#c0392b' : ''}">${d.freqFilteredCnt != null ? d.freqFilteredCnt : 0}</b></span>
+        <span class="cell price">出价 <b>${d.winner ? fmt(d.winner.bid) : '-'}</b></span>
+        <span class="cell price">成交价(${priceMode}) <b>${fmt(pay)}</b></span>
+        <span class="cell">检索耗时 <b>${d.cost && d.cost.candidate != null ? d.cost.candidate : '-'}</b> ms</span>
+        <span class="cell">接口耗时 <b>${wallMs != null ? wallMs : '-'}</b> ms</span>
+      </div>`;
+    el = c;
+    // 实时统计
+    document.getElementById('s-total').textContent = stats.total;
+    document.getElementById('s-win').textContent = stats.win;
+    document.getElementById('s-fb').textContent = stats.fb;
+    document.getElementById('s-avg').textContent = fmt(avg);
+    document.getElementById('s-spend').textContent = fmt(stats.spend);
+    document.getElementById('s-p50').textContent = p50;
+  }
+  feed.appendChild(el);
+  feed.scrollTop = feed.scrollHeight; // 滚到底，贴合“下滑加载”直觉
+}
+
+function esc(s) { return String(s).replace(/[&<>"]/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[m])); }
+function clearFeed() { feed.innerHTML = '<div class="err" style="margin-top:40px">已清空，滚动或点击加载新广告。</div>'; }
+
+// 鼠标滚轮：向下滑加载（节流，避免一次手势刷爆）
+let lastWheel = 0;
+window.addEventListener('wheel', (e) => {
+  const now = Date.now();
+  if (now - lastWheel < 350) return;
+  lastWheel = now;
+  if (e.deltaY > 0 || e.deltaY < 0) loadOne();
+  flashHint();
+}, { passive: true });
+
+// 点击空白处加载
+feed.addEventListener('click', (e) => {
+  if (e.target === feed || e.target.classList.contains('err')) { loadOne(); flashHint(); }
+});
+
+let hintTimer;
+function flashHint() {
+  hint.style.opacity = '1';
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => hint.style.opacity = '0', 1200);
+}
+flashHint();
+</script>
+</body>
+</html>

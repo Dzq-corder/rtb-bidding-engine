@@ -29,6 +29,9 @@ public class BidLog {
 
     private String slotCode;
 
+    /** 用户标识（频控维度）；未传 userId 时为空（此时频控按 IP 计数，不落库） */
+    private String userId;
+
     // ---- 请求上下文（用户画像）
 
     private String region;
@@ -46,6 +49,9 @@ public class BidLog {
 
     /** 定向过滤后数量，M1 无定向过滤，等于 candidateCnt；M2 起为真实求交结果 */
     private Integer matchCnt;
+
+    /** 本轮被频控剔除的候选数，>0 说明频控生效 */
+    private Integer freqFilteredCnt;
 
     private Integer hasAd;
 

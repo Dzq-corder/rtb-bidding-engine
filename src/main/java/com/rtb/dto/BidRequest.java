@@ -44,6 +44,20 @@ public class BidRequest {
     private String categoryCode;
 
     /**
+     * 用户标识（登录态传 userId，未登录传设备 ID），频控维度。
+     * 缺失时退化为按客户端 IP 频控。
+     */
+    private String userId;
+
+    /**
+     * 客户端 IP，由 Controller 从 {@code X-Forwarded-For} / {@code RemoteAddr} 填充。
+     *
+     * <p><b>不接受调用方直传</b>（否则伪造 IP 即可绕过频控），故与 JSON 反序列化解绑。
+     */
+    @com.fasterxml.jackson.annotation.JsonIgnore
+    private String clientIp;
+
+    /**
      * 竞价结果详情，演示时展示给用户看。
      * M9 才会被前端真正用起来，M1 先在接口返回里带着，便于冒烟时肉眼核对。
      */
@@ -58,8 +72,13 @@ public class BidRequest {
         private AdInfo winner;
         /** 候选集大小，检索返回行数 */
         private Integer candidateCnt;
-        /** 定向过滤后数量 */
+        /** 定向过滤后数量（频控前） */
         private Integer matchCnt;
+        /**
+         * 被频控剔除的候选数。
+         * 0 表示无候选超频（或频控未生效）；真正参与计费 = matchCnt - freqFilteredCnt。
+         */
+        private Integer freqFilteredCnt;
         /** 出价降序后的前 N 条，M1 为 10 */
         private List<AdInfo> topCandidates;
         /** 计费方式：0 一价 1 二价 */

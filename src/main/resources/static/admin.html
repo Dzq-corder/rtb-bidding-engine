@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RTB 广告管理端</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; background: #f1f5f9; color: #0f172a; height: 100vh; display: flex; flex-direction: column; font-size: 13px; }
+  .top { background: #0f172a; color: #fff; padding: 10px 16px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .top h1 { font-size: 15px; font-weight: 500; }
+  .top input, .top select { padding: 6px 8px; border: 1px solid #334155; border-radius: 8px; background: #1e293b; color: #fff; font-size: 13px; }
+  .tabs button { background: #1e293b; border: none; color: #cbd5e1; padding: 6px 12px; border-radius: 8px; cursor: pointer; font-size: 13px; }
+  .tabs button.on { background: #2563eb; color: #fff; }
+  .spacer { flex: 1; }
+  .btn { background: #2563eb; color: #fff; border: none; padding: 6px 14px; border-radius: 8px; cursor: pointer; font-size: 13px; }
+  .btn:hover { background: #1d4ed8; }
+  .btn.ghost { background: #475569; }
+  .main { flex: 1; display: grid; grid-template-columns: 1fr 360px; gap: 12px; padding: 12px; overflow: hidden; }
+  .panel { background: #fff; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.06); overflow: auto; padding: 12px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #f1f5f9; white-space: nowrap; }
+  th { color: #64748b; font-weight: 500; font-size: 12px; position: sticky; top: 0; background: #fff; }
+  .s1 { color: #15803d; background: #dcfce7; padding: 2px 8px; border-radius: 999px; }
+  .s2 { color: #475569; background: #e2e8f0; padding: 2px 8px; border-radius: 999px; }
+  .s3 { color: #991b1b; background: #fee2e2; padding: 2px 8px; border-radius: 999px; }
+  .rowbtn { font-size: 12px; padding: 4px 10px; border: 1px solid #cbd5e1; background: #fff; border-radius: 6px; cursor: pointer; margin-right: 4px; }
+  .rowbtn:hover { background: #f1f5f9; }
+  .form h2 { font-size: 14px; font-weight: 500; margin-bottom: 10px; }
+  .field { margin-bottom: 10px; }
+  .field label { display: block; color: #64748b; margin-bottom: 4px; }
+  .field input, .field select { width: 100%; padding: 7px 9px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 13px; }
+  .tg { border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px; margin-bottom: 8px; }
+  .tg-row { display: flex; gap: 6px; margin-bottom: 6px; }
+  .tg-row input, .tg-row select { flex: 1; padding: 6px 8px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 12px; }
+  .msg { font-size: 12px; padding: 8px; border-radius: 8px; margin-bottom: 10px; display: none; }
+  .msg.ok { background: #dcfce7; color: #166534; display: block; }
+  .msg.err { background: #fee2e2; color: #991b1b; display: block; }
+  .pager { display: flex; align-items: center; gap: 8px; padding: 8px; }
+  .pager button { padding: 5px 10px; border: 1px solid #cbd5e1; background: #fff; border-radius: 6px; cursor: pointer; }
+  .empty { color: #94a3b8; text-align: center; padding: 40px; }
+  .who { background: #1e293b; color: #cbd5e1; padding: 4px 10px; border-radius: 999px; font-size: 12px; }
+  .overlay { position: fixed; inset: 0; background: rgba(15,23,42,.55); display: flex; align-items: center; justify-content: center; z-index: 50; }
+  .overlay .card { background: #fff; width: 320px; max-width: 90vw; border-radius: 14px; padding: 20px; box-shadow: 0 10px 30px rgba(0,0,0,.2); }
+  .overlay h2 { font-size: 16px; font-weight: 500; margin-bottom: 4px; }
+  .overlay .sub { color: #64748b; font-size: 12px; margin-bottom: 14px; }
+  .overlay .msg { margin-top: 10px; }
+</style>
+</head>
+<body>
+  <div id="login" class="overlay">
+    <div class="card">
+      <h2>广告商登录</h2>
+      <p class="sub">输入你的广告商 ID 进入。演示环境：密码任意。</p>
+      <div class="field"><label>广告商 ID</label><input id="l-adv" type="number" placeholder="如 1001"></div>
+      <div class="field"><label>密码</label><input id="l-pwd" type="password" placeholder="demo"></div>
+      <button class="btn" style="width:100%" onclick="doLogin()">登录</button>
+      <div id="l-msg" class="msg"></div>
+    </div>
+  </div>
+
+  <div class="top">
+    <h1>RTB 广告管理端</h1>
+    <span id="who" class="who"></span>
+    <div class="tabs" id="tabs">
+      <button data-st="" class="on">全部</button>
+      <button data-st="1">在投</button>
+      <button data-st="2">暂停</button>
+      <button data-st="3">已耗尽</button>
+    </div>
+    <div class="spacer"></div>
+    <button class="btn" onclick="openCreate()">+ 投放新广告</button>
+    <button class="btn ghost" onclick="loadList()">刷新</button>
+    <button class="btn ghost" onclick="logout()">退出</button>
+  </div>
+
+  <div class="main">
+    <div class="panel">
+      <table>
+        <thead><tr>
+          <th>ID</th><th>标题</th><th>广告主</th><th>类目</th>
+          <th>出价</th><th>日预算</th><th>状态</th><th>操作</th>
+        </tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <div id="empty" class="empty" style="display:none">无广告，点右上「投放新广告」创建</div>
+      <div class="pager">
+        <button onclick="go(-1)">上一页</button>
+        <span id="pg">1 / 1</span>
+        <button onclick="go(1)">下一页</button>
+      </div>
+    </div>
+
+    <div class="panel form">
+      <h2 id="form-title">投放新广告</h2>
+      <div id="msg" class="msg"></div>
+      <div class="field"><label>广告主（当前登录身份，不可改）</label><div id="f-who" style="padding:7px 9px;background:#f1f5f9;border-radius:8px;color:#475569">—</div></div>
+      <div class="field"><label>标题</label><input id="f-title" placeholder="9.9 包邮洗护套装"></div>
+      <div class="field"><label>素材URL</label><input id="f-url" placeholder="https://cdn.x/cre.jpg"></div>
+      <div class="field"><label>类目 categoryCode</label><input id="f-cat" placeholder="ecommerce"></div>
+      <div class="field"><label>出价（元，单次展示）</label><input id="f-bid" type="number" step="0.0001" placeholder="1.5000"></div>
+      <div class="field"><label>日预算（元）</label><input id="f-budget" type="number" step="0.01" placeholder="2000.00"></div>
+      <div class="field"><label>状态</label>
+        <select id="f-status"><option value="1">1 在投（启用）</option><option value="2">2 暂停</option></select>
+      </div>
+      <div class="field">
+        <label>定向条件（至少 1 条）</label>
+        <div id="targets"></div>
+        <button class="rowbtn" type="button" onclick="addTarget()">+ 加一条定向</button>
+      </div>
+      <div style="display:flex; gap:8px;">
+        <button class="btn" onclick="submitForm()">保存</button>
+        <button class="btn ghost" onclick="resetForm()">清空</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+const ST = { 1: '<span class="s1">在投</span>', 2: '<span class="s2">暂停</span>', 3: '<span class="s3">已耗尽</span>' };
+let curSt = ''; let pageNum = 1; const pageSize = 20; let editingId = null;
+let ME = null; const adMap = {};   // ME=当前登录广告商ID；adMap 缓存 广告ID→广告主ID 用于前端越权拦截
+
+function owns(id) { return ME != null && adMap[id] === ME; }
+function doLogin() {
+  const adv = parseInt(document.getElementById('l-adv').value.trim(), 10);
+  if (!adv || adv <= 0) { const m = document.getElementById('l-msg'); m.textContent = '请输入有效的广告商 ID'; m.className = 'msg err'; return; }
+  ME = adv;
+  try { sessionStorage.setItem('adv', String(ME)); } catch (e) {}
+  document.getElementById('who').textContent = '广告商 #' + ME;
+  document.getElementById('login').style.display = 'none';
+  pageNum = 1; loadList();
+}
+function logout() {
+  ME = null; try { sessionStorage.removeItem('adv'); } catch (e) {}
+  document.getElementById('who').textContent = '';
+  document.getElementById('login').style.display = 'flex';
+}
+
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[m])); }
+function showMsg(t, ok) { const m = document.getElementById('msg'); m.textContent = t; m.className = 'msg ' + (ok ? 'ok' : 'err'); setTimeout(() => m.className = 'msg', 3000); }
+async function api(url, opt) {
+  const r = await fetch(url, opt); const j = await r.json();
+  if (j.code !== 0) throw new Error(j.msg || ('HTTP ' + r.status));
+  return j.data;
+}
+
+async function loadList() {
+  if (!ME) return;
+  const p = new URLSearchParams({ pageNum, pageSize, advertiserId: ME });
+  if (curSt) p.set('status', curSt);
+  try {
+    const d = await api('/admin/ad?' + p.toString());
+    const tb = document.getElementById('rows'); tb.innerHTML = '';
+    document.getElementById('empty').style.display = d.list.length ? 'none' : 'block';
+    d.list.forEach(ad => {
+      adMap[ad.id] = ad.advertiserId;
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${ad.id}</td><td>${esc(ad.title)}</td><td>${ad.advertiserId}</td><td>${esc(ad.categoryCode)}</td>
+        <td>¥${Number(ad.bid).toFixed(4)}</td><td>¥${Number(ad.dailyBudget).toFixed(2)}</td>
+        <td>${ST[ad.status] || ad.status}</td>
+        <td>
+          <button class="rowbtn" onclick="openEdit(${ad.id})">编辑</button>
+          <button class="rowbtn" onclick="toggleStatus(${ad.id},${ad.status})">${ad.status === 1 ? '暂停' : '启用'}</button>
+          <button class="rowbtn" onclick="delAd(${ad.id})">删除</button>
+        </td>`;
+      tb.appendChild(tr);
+    });
+    document.getElementById('pg').textContent = pageNum + ' / ' + (d.pages || 1);
+  } catch (e) { showMsg('列表加载失败：' + e.message, false); }
+}
+function go(d) { if (d < 0 && pageNum <= 1) return; pageNum += d; if (pageNum < 1) pageNum = 1; loadList(); }
+
+document.getElementById('tabs').addEventListener('click', e => {
+  if (e.target.tagName !== 'BUTTON') return;
+  [...e.currentTarget.children].forEach(b => b.classList.remove('on'));
+  e.target.classList.add('on'); curSt = e.target.dataset.st || ''; pageNum = 1; loadList();
+});
+
+function addTarget(dimType = 1, dimValue = '110120') {
+  const box = document.getElementById('targets');
+  const row = document.createElement('div'); row.className = 'tg';
+  row.innerHTML = `<div class="tg-row">
+      <select onchange="this.parentNode.nextElementSibling.value=''">
+        <option value="1" ${dimType==1?'selected':''}>1 地域</option>
+        <option value="2" ${dimType==2?'selected':''}>2 年龄段</option>
+        <option value="3" ${dimType==3?'selected':''}>3 性别</option>
+        <option value="4" ${dimType==4?'selected':''}>4 兴趣</option>
+      </select>
+      <input placeholder="值，如 110120 / 31-35 / male" value="${esc(dimValue)}">
+      <button class="rowbtn" type="button" onclick="this.closest('.tg').remove()">×</button>
+    </div>`;
+  box.appendChild(row);
+}
+function collectTargets() {
+  const out = [];
+  document.querySelectorAll('#targets .tg').forEach(tg => {
+    const sel = tg.querySelector('select'); const inp = tg.querySelector('input');
+    if (inp.value.trim()) out.push({ dimType: Number(sel.value), dimValue: inp.value.trim() });
+  });
+  return out;
+}
+
+function openCreate() { editingId = null; resetForm(); document.getElementById('form-title').textContent = '投放新广告'; }
+function resetForm() {
+  ['f-title','f-url','f-cat','f-bid','f-budget'].forEach(id => document.getElementById(id).value = '');
+  document.getElementById('f-who').textContent = ME != null ? ('广告商 #' + ME) : '—';
+  document.getElementById('f-status').value = '1';
+  document.getElementById('targets').innerHTML = ''; addTarget();
+}
+async function openEdit(id) {
+  if (!owns(id)) { showMsg('只能操作自己的广告', false); return; }
+  try {
+    const d = await api('/admin/ad/' + id);
+    editingId = id;
+    document.getElementById('form-title').textContent = '编辑广告 #' + id;
+    document.getElementById('f-who').textContent = '广告商 #' + (d.ad.advertiserId || ME);
+    document.getElementById('f-title').value = d.ad.title || '';
+    document.getElementById('f-url').value = d.ad.creativeUrl || '';
+    document.getElementById('f-cat').value = d.ad.categoryCode || '';
+    document.getElementById('f-bid').value = d.ad.bid || '';
+    document.getElementById('f-budget').value = d.ad.dailyBudget || '';
+    document.getElementById('f-status').value = String(d.ad.status === 3 ? 2 : d.ad.status);
+    document.getElementById('targets').innerHTML = '';
+    if (d.targets && d.targets.length) d.targets.forEach(t => addTarget(t.dimType, t.dimValue));
+    else addTarget();
+  } catch (e) { showMsg('加载详情失败：' + e.message, false); }
+}
+
+async function submitForm() {
+  if (ME == null) return showMsg('请先登录', false);
+  const targets = collectTargets();
+  if (!targets.length) return showMsg('至少需要一条定向条件', false);
+  const body = {
+    title: document.getElementById('f-title').value.trim(),
+    creativeUrl: document.getElementById('f-url').value.trim(),
+    categoryCode: document.getElementById('f-cat').value.trim(),
+    bid: document.getElementById('f-bid').value,
+    dailyBudget: document.getElementById('f-budget').value,
+    status: Number(document.getElementById('f-status').value),
+    targets
+  };
+  if (editingId == null) body.advertiserId = ME;
+  try {
+    if (editingId == null) { await api('/admin/ad', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); showMsg('投放成功', true); }
+    else { await api('/admin/ad/' + editingId, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); showMsg('已更新 #' + editingId, true); }
+    resetForm(); loadList();
+  } catch (e) { showMsg('保存失败：' + e.message, false); }
+}
+
+async function toggleStatus(id, st) {
+  if (!owns(id)) { showMsg('只能操作自己的广告', false); return; }
+  const next = st === 1 ? 2 : 1;
+  try { await api('/admin/ad/' + id + '/status?status=' + next, { method: 'PUT' }); loadList(); }
+  catch (e) { showMsg('切换状态失败：' + e.message, false); }
+}
+async function delAd(id) {
+  if (!owns(id)) { showMsg('只能操作自己的广告', false); return; }
+  if (!confirm('确认删除广告 #' + id + '？')) return;
+  try { await api('/admin/ad/' + id, { method: 'DELETE' }); showMsg('已删除 #' + id, true); loadList(); }
+  catch (e) { showMsg('删除失败：' + e.message, false); }
+}
+
+(function init() {
+  let saved = null; try { saved = sessionStorage.getItem('adv'); } catch (e) {}
+  if (saved) {
+    ME = parseInt(saved, 10);
+    document.getElementById('who').textContent = '广告商 #' + ME;
+    document.getElementById('login').style.display = 'none';
+    resetForm(); loadList();
+  } else {
+    document.getElementById('login').style.display = 'flex';
+  }
+})();
+</script>
+</body>
+</html>
